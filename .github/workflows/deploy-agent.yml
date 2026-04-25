@@ -1,0 +1,156 @@
+# .github/workflows/deploy-agent.yml
+#
+# RFP Agent — Build & Deploy to Azure Container Apps
+
+name: RFP Agent — Build & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Where to deploy (azure | aws | gcp). Currently only azure supported.'
+        required: false
+        default: 'azure'
+      deployment_id:
+        description: 'Platform deployment ID (passed by cicd-connector).'
+        required: false
+      platform_webhook:
+        description: 'Webhook URL to call when deploy completes.'
+        required: false
+
+permissions:
+  id-token: write       # required for federated OIDC auth to Azure
+  contents: read
+
+env:
+  AGENT_ID:           rfp-agent
+  CONTAINER_APP_NAME: rfp-agent
+  RESOURCE_GROUP:     ai-platform-rg
+  IMAGE_TAG:          ${{ github.sha }}
+
+jobs:
+
+  # ─── BUILD ──────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in ACR
+        id: meta
+        run: |
+          ACR_NAME="$(echo '${{ vars.ACR_LOGIN_SERVER }}' | cut -d. -f1)"
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}"
+
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}" \
+            --image "${{ env.AGENT_ID }}:latest" \
+            .
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  # ─── DEPLOY ─────────────────────────────────────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update or create Container App
+        run: |
+          set -e
+          IMAGE="${{ needs.build.outputs.image }}"
+
+          if az containerapp show \
+               --name "${{ env.CONTAINER_APP_NAME }}" \
+               --resource-group "${{ env.RESOURCE_GROUP }}" \
+               >/dev/null 2>&1; then
+            echo "→ Container App exists — updating image"
+            az containerapp update \
+              --name "${{ env.CONTAINER_APP_NAME }}" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --image "$IMAGE"
+          else
+            echo "→ Container App does not exist — creating"
+            az containerapp create \
+              --name "${{ env.CONTAINER_APP_NAME }}" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --environment "${{ vars.CONTAINER_ENV_ID }}" \
+              --image "$IMAGE" \
+              --target-port 3010 \
+              --ingress external \
+              --transport auto \
+              --min-replicas 1 \
+              --max-replicas 5 \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --user-assigned "${{ vars.PLATFORM_IDENTITY_ID }}" \
+              --registry-server "${{ vars.ACR_LOGIN_SERVER }}" \
+              --registry-identity "${{ vars.PLATFORM_IDENTITY_ID }}" \
+              --env-vars \
+                AGENT_ID="${{ env.AGENT_ID }}" \
+                NODE_ENV=production \
+                PORT=3010 \
+                PLATFORM_KEYVAULT_URI="${{ vars.PLATFORM_KEYVAULT_URI }}"
+          fi
+
+      - name: Verify deployment
+        run: |
+          set -e
+          sleep 20
+
+          STATE=$(az containerapp show \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "properties.runningStatus" -o tsv)
+
+          FQDN=$(az containerapp show \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          if [ "$STATE" != "Running" ]; then
+            echo "::error::Container App is not Running (state: $STATE)"
+            exit 1
+          fi
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$FQDN/" || echo "000")
+          echo "::notice::${{ env.CONTAINER_APP_NAME }} live at https://$FQDN (HTTP $STATUS)"
+
+      - name: Callback to platform webhook
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform_webhook != '' }}
+        run: |
+          curl -s -X POST "${{ inputs.platform_webhook }}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: workflow_run" \
+            -d "{
+              \"action\": \"completed\",
+              \"workflow_run\": {
+                \"conclusion\": \"success\",
+                \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+                \"inputs\": {
+                  \"deployment_id\": \"${{ inputs.deployment_id }}\"
+                }
+              }
+            }" \
+            || echo "Webhook callback failed (non-fatal)"

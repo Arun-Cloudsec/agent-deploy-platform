@@ -1,6 +1,19 @@
 # .github/workflows/deploy-agent.yml
 #
-# RFP Agent — Build & Deploy to Azure Container Apps
+# v5: Region-aware deploy. Triggered by the marketplace via workflow_dispatch
+# with target_region input. Resolves resource group and env from that.
+#
+# Required GitHub repo SECRETS:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# Required GitHub repo VARIABLES:
+#   ACR_LOGIN_SERVER                 (shared UAE registry)
+#   CONTAINER_ENV_ID                 (UAE env)
+#   PLATFORM_IDENTITY_ID             (UAE identity)
+#   PLATFORM_KEYVAULT_URI            (UAE KV uri)
+#   CONTAINER_ENV_ID_UKSOUTH         (UK env)
+#   PLATFORM_IDENTITY_ID_UKSOUTH     (UK identity)
+#   PLATFORM_KEYVAULT_URI_UKSOUTH    (UK KV uri)
 
 name: RFP Agent — Build & Deploy
 
@@ -9,47 +22,85 @@ on:
     branches: [ main ]
   workflow_dispatch:
     inputs:
-      deploy_target:
-        description: 'Where to deploy (azure | aws | gcp). Currently only azure supported.'
+      target_region:
+        description: 'Azure region (uaenorth | uksouth)'
         required: false
-        default: 'azure'
+        default: 'uaenorth'
+      tenant_slug:
+        description: 'Tenant slug (lowercase, alphanumeric + hyphens)'
+        required: false
+        default: ''
       deployment_id:
-        description: 'Platform deployment ID (passed by cicd-connector).'
+        description: 'Marketplace deployment ID (for callback)'
         required: false
       platform_webhook:
-        description: 'Webhook URL to call when deploy completes.'
+        description: 'Marketplace webhook URL'
         required: false
 
 permissions:
-  id-token: write       # required for federated OIDC auth to Azure
+  id-token: write
   contents: read
 
 env:
-  AGENT_ID:           rfp-agent
-  CONTAINER_APP_NAME: rfp-agent
-  RESOURCE_GROUP:     ai-platform-rg
-  IMAGE_TAG:          ${{ github.sha }}
+  AGENT_ID: rfp-agent
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    outputs:
+      region:        ${{ steps.resolve.outputs.region }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      env_id:        ${{ steps.resolve.outputs.env_id }}
+      identity_id:   ${{ steps.resolve.outputs.identity_id }}
+      kv_uri:        ${{ steps.resolve.outputs.kv_uri }}
+      container_app: ${{ steps.resolve.outputs.container_app }}
+    steps:
+      - name: Resolve target region
+        id: resolve
+        run: |
+          REGION="${{ inputs.target_region || 'uaenorth' }}"
+          SLUG="${{ inputs.tenant_slug }}"
 
-  # ─── BUILD ──────────────────────────────────────────────────────────────────
+          # Container app name: rfp-agent or rfp-agent-<slug>
+          if [ -n "$SLUG" ]; then
+            APP_NAME="${{ env.AGENT_ID }}-${SLUG}"
+          else
+            APP_NAME="${{ env.AGENT_ID }}"
+          fi
+
+          echo "region=$REGION"             >> "$GITHUB_OUTPUT"
+          echo "container_app=$APP_NAME"    >> "$GITHUB_OUTPUT"
+
+          if [ "$REGION" = "uksouth" ]; then
+            echo "resource_group=ai-platform-rg-uksouth"                     >> "$GITHUB_OUTPUT"
+            echo "env_id=${{ vars.CONTAINER_ENV_ID_UKSOUTH }}"               >> "$GITHUB_OUTPUT"
+            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID_UKSOUTH }}"      >> "$GITHUB_OUTPUT"
+            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI_UKSOUTH }}"          >> "$GITHUB_OUTPUT"
+          else
+            echo "resource_group=ai-platform-rg"                             >> "$GITHUB_OUTPUT"
+            echo "env_id=${{ vars.CONTAINER_ENV_ID }}"                       >> "$GITHUB_OUTPUT"
+            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID }}"              >> "$GITHUB_OUTPUT"
+            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI }}"                  >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::notice::Deploying to $APP_NAME in $REGION"
+
   build:
+    needs: resolve-target
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Login to Azure
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build image in ACR
+      - name: Build image in shared ACR
         id: meta
         run: |
           ACR_NAME="$(echo '${{ vars.ACR_LOGIN_SERVER }}' | cut -d. -f1)"
@@ -63,14 +114,11 @@ jobs:
 
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-  # ─── DEPLOY ─────────────────────────────────────────────────────────────────
   deploy:
-    needs: build
+    needs: [resolve-target, build]
     runs-on: ubuntu-latest
-
     steps:
-      - name: Login to Azure
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
@@ -79,23 +127,22 @@ jobs:
       - name: Update or create Container App
         run: |
           set -e
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
           IMAGE="${{ needs.build.outputs.image }}"
 
-          if az containerapp show \
-               --name "${{ env.CONTAINER_APP_NAME }}" \
-               --resource-group "${{ env.RESOURCE_GROUP }}" \
-               >/dev/null 2>&1; then
+          if az containerapp show --name "$APP" --resource-group "$RG" >/dev/null 2>&1; then
             echo "→ Container App exists — updating image"
-            az containerapp update \
-              --name "${{ env.CONTAINER_APP_NAME }}" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
+            az containerapp update --no-wait \
+              --name "$APP" \
+              --resource-group "$RG" \
               --image "$IMAGE"
           else
-            echo "→ Container App does not exist — creating"
-            az containerapp create \
-              --name "${{ env.CONTAINER_APP_NAME }}" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --environment "${{ vars.CONTAINER_ENV_ID }}" \
+            echo "→ Creating new Container App"
+            az containerapp create --no-wait \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --environment "${{ needs.resolve-target.outputs.env_id }}" \
               --image "$IMAGE" \
               --target-port 3010 \
               --ingress external \
@@ -104,53 +151,41 @@ jobs:
               --max-replicas 5 \
               --cpu 0.5 \
               --memory 1.0Gi \
-              --user-assigned "${{ vars.PLATFORM_IDENTITY_ID }}" \
+              --user-assigned "${{ needs.resolve-target.outputs.identity_id }}" \
               --registry-server "${{ vars.ACR_LOGIN_SERVER }}" \
-              --registry-identity "${{ vars.PLATFORM_IDENTITY_ID }}" \
+              --registry-identity "${{ needs.resolve-target.outputs.identity_id }}" \
               --env-vars \
                 AGENT_ID="${{ env.AGENT_ID }}" \
                 NODE_ENV=production \
                 PORT=3010 \
-                PLATFORM_KEYVAULT_URI="${{ vars.PLATFORM_KEYVAULT_URI }}"
+                TENANT_SLUG="${{ inputs.tenant_slug }}" \
+                TARGET_REGION="${{ needs.resolve-target.outputs.region }}" \
+                PLATFORM_KEYVAULT_URI="${{ needs.resolve-target.outputs.kv_uri }}"
           fi
 
-      - name: Verify deployment
+      - name: Wait for revision to become healthy
         run: |
           set -e
-          sleep 20
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
 
-          STATE=$(az containerapp show \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "properties.runningStatus" -o tsv)
+          for i in $(seq 1 40); do
+            STATE=$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query "properties.runningStatus" -o tsv 2>/dev/null || echo "Unknown")
+            HEALTH=$(az containerapp revision list --name "$APP" --resource-group "$RG" \
+              --query "[?properties.active].properties.healthState | [0]" -o tsv 2>/dev/null || echo "")
+            echo "  poll $i: running=$STATE health=$HEALTH"
+            if [ "$STATE" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "✓ Container App healthy"
+              break
+            fi
+            sleep 6
+          done
 
-          FQDN=$(az containerapp show \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "properties.configuration.ingress.fqdn" -o tsv)
-
-          if [ "$STATE" != "Running" ]; then
-            echo "::error::Container App is not Running (state: $STATE)"
-            exit 1
-          fi
-
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$FQDN/" || echo "000")
-          echo "::notice::${{ env.CONTAINER_APP_NAME }} live at https://$FQDN (HTTP $STATUS)"
-
-      - name: Callback to platform webhook
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform_webhook != '' }}
+      - name: Report URL
         run: |
-          curl -s -X POST "${{ inputs.platform_webhook }}" \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Event: workflow_run" \
-            -d "{
-              \"action\": \"completed\",
-              \"workflow_run\": {
-                \"conclusion\": \"success\",
-                \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
-                \"inputs\": {
-                  \"deployment_id\": \"${{ inputs.deployment_id }}\"
-                }
-              }
-            }" \
-            || echo "Webhook callback failed (non-fatal)"
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
+          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "::notice::$APP live at https://$FQDN"

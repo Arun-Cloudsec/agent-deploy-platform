@@ -161,13 +161,17 @@ jobs:
       # (e.g. 'rfp', 'openclaw'). The deploy workflow itself lives here in
       # agent-deploy-platform, but the code we BUILD comes from the agent repo.
       - name: Checkout source repo (${{ inputs.source_repo }})
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
         with:
           repository: ${{ github.repository_owner }}/${{ inputs.source_repo }}
           # Marketplace runs as ${{ secrets.GITHUB_TOKEN }} which works for
           # public repos in the same org. For private repos, swap this for a
           # PAT with `contents:read` on the agent repo.
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Don't leave the token in .git/config — subsequent steps don't need
+          # to push, and persisted creds widen the blast radius if a later
+          # action is compromised. (zizmor: credential-persistence)
+          persist-credentials: false
       - uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
@@ -294,10 +298,11 @@ jobs:
       image_uri: ${{ steps.push.outputs.image_uri }}
     steps:
       - name: Checkout source repo (${{ inputs.source_repo }})
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
         with:
           repository: ${{ github.repository_owner }}/${{ inputs.source_repo }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:

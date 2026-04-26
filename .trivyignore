@@ -1,0 +1,14 @@
+# .trivyignore — CVE deferral list for AgentOS
+#
+# Format: one CVE ID per line. Always include a comment with:
+#   - Why this is being ignored
+#   - The reviewer (initials)
+#   - An expiry date (after which the entry should be re-reviewed)
+#
+# Empty lines and lines starting with '#' are ignored by Trivy.
+#
+# DO NOT add entries here without a justification. A 6-month-old `# false
+# positive` with no name and no date is functionally the same as broken
+# security.
+
+# (No active deferrals. Add CVEs below this line when needed.)

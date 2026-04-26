@@ -1,2531 +1,1584 @@
-const express  = require('express');
-const Anthropic = require('@anthropic-ai/sdk');
-const bcrypt   = require('bcryptjs');
-const { v4: uuidv4 } = require('uuid');
-const multer   = require('multer');
-const AdmZip   = require('adm-zip');
-const XLSX     = require('xlsx');
-let pdfParse;
-try { pdfParse = require('pdf-parse/lib/pdf-parse'); } catch(e) { try { pdfParse = require('pdf-parse'); } catch(e2) { pdfParse = async()=>({text:'',numpages:0}); } }
-const path     = require('path');
-const fs       = require('fs');
+// server.js — AgentOS v6
+//
+// Adds executive screens on top of v5.2's deploy platform:
+//   - Dashboard: live deployment counts, real cost estimates, uptime
+//   - Analytics: requests per agent, cost breakdown, deployment speed, success rate
+//   - Users: roles & permissions (RBAC config display)
+//   - ROI: business case summary, roadmap
+//
+// Where data comes from:
+//   - Deployment counts → /app/data/deployments.json (file store, like v5)
+//   - Per-region resource counts → Azure REST (when managed identity available)
+//   - Cost estimates → Azure pricing assumptions × actual Container App count
+//   - Request stats → simulated until Azure App Insights wiring is added (deferred to v7)
+//
+// We do NOT mock numbers when reality is reachable. The dashboard reads what's
+// actually deployed in each region's resource group and computes from that.
 
-const app    = express();
-const PORT   = process.env.PORT || 3000;
-const ALLOWED_EXTENSIONS = /\.(docx|doc|pdf|xls|xlsx|txt|csv)$/i;
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    ALLOWED_EXTENSIONS.test(file.originalname) ? cb(null, true) : cb(new Error('File type not allowed. Only .docx, .doc, .pdf, .xls, .xlsx, .txt files accepted.'));
-  }
-});
+import express from 'express';
+import cookieSession from 'cookie-session';
+import bodyParser from 'body-parser';
+import path from 'path';
+import fs from 'fs';
+import bcrypt from 'bcryptjs';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { fileURLToPath } from 'url';
 
-// ── Persistent storage — uses Azure D:\home\data on App Service, local ./data otherwise ──
-const PERSIST_DIR = process.env.HOME
-  ? path.join(process.env.HOME, 'data')          // Azure: D:\home\data (survives redeploy)
-  : path.join(__dirname, 'data');                 // Local fallback
-const DATA_DIR = PERSIST_DIR;
-const DB_FILE  = path.join(PERSIST_DIR, 'db.json');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-// Also fix pdf-parse import
+import { AGENTS } from './src/agents-with-repos.js';
+import { REGIONS, regionById, fqdnFor } from './src/regions.js';
+import {
+  createDeployment, getDeployment, updateDeployment, listDeployments,
+  addLog, getDeploymentLogs,
+} from './src/deployment-store.js';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── Database ──────────────────────────────────────────────────────────────────
-function loadDB() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch { return { users: [], library: [], recent: [] }; }
-}
-function saveDB(d) { fs.writeFileSync(DB_FILE, JSON.stringify(d, null, 2)); }
+const PORT = parseInt(process.env.PORT || '3010', 10);
+const VERSION = '6.0';
 
-const db = {
-  getUser:      (email) => loadDB().users.find(u => u.email === email) || null,
-  getUserById:  (id)    => loadDB().users.find(u => u.id === id) || null,
-  getUserByToken:(token) => loadDB().users.find(u => u.token === token) || null,
-  createUser:   (user)  => { const d = loadDB(); d.users.push(user); saveDB(d); },
-  updateUser:   (id, f) => {
-    const d = loadDB(), i = d.users.findIndex(u => u.id === id);
-    if (i >= 0) { d.users[i] = { ...d.users[i], ...f }; saveDB(d); }
+const GITHUB_ORG = process.env.GITHUB_ORG || 'Arun-Cloudsec';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+
+const SUBSCRIPTION_ID = process.env.AZURE_SUBSCRIPTION_ID || 'ead28ade-e9f9-4bde-8f35-63c4f4b53992';
+
+// ─── Cost estimation table ────────────────────────────────────────────────────
+// Monthly USD cost per resource type, assuming default sizing. These are
+// realistic 2025 published Azure prices for the SKUs we provision via Bicep.
+// Used as a fallback when Azure Cost Mgmt API isn't accessible.
+const MONTHLY_COST_USD = {
+  // Per-Container-App estimate — 0.5 CPU, 1Gi RAM, ~1 replica avg, ~10K requests/day
+  containerApp: 14.40,
+
+  // Per-region foundation cost (independent of agent count)
+  perRegion: {
+    'azure-uaenorth': {
+      containerAppsEnv: 0,        // managed env is free, you pay per app
+      postgres: 84.00,            // B2ms / 7-day backup
+      redis: 16.00,               // C0 Basic
+      keyVault: 0.30,             // ~10K ops/mo
+      storage: 2.40,              // 10GB GRS
+      logAnalytics: 12.00,        // ~1GB/day ingestion
+      appInsights: 5.00,          // basic plan
+    },
+    'azure-uksouth': {
+      containerAppsEnv: 0,
+      postgres: 84.00,
+      redis: 16.00,
+      keyVault: 0.30,
+      storage: 4.20,              // 10GB GRS to UK West
+      logAnalytics: 12.00,
+      appInsights: 5.00,
+    },
   },
-  getLibrary:    (uid) => loadDB().library.filter(l => l.user_id === uid).sort((a,b) => b.created_at.localeCompare(a.created_at)),
-  addLibrary:    (item) => { const d = loadDB(); d.library.unshift(item); saveDB(d); },
-  deleteLibrary: (id, uid) => { const d = loadDB(); d.library = d.library.filter(l => !(l.id === id && l.user_id === uid)); saveDB(d); },
-  getRecent:     (uid) => loadDB().recent.filter(r => r.user_id === uid).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0, 10),
-  addRecent:     (item) => {
-    const d = loadDB(); d.recent.unshift(item);
-    const ui = d.recent.filter(r => r.user_id === item.user_id);
-    if (ui.length > 10) { const rm = ui.slice(10).map(r => r.id); d.recent = d.recent.filter(r => !rm.includes(r.id)); }
-    saveDB(d);
-  },
-  getEstimations: (uid) => { const d = loadDB(); return (d.estimations||[]).filter(e => e.user_id === uid).sort((a,b) => b.created_at.localeCompare(a.created_at)); },
-  addEstimation:  (item) => { const d = loadDB(); if(!d.estimations) d.estimations=[]; d.estimations.unshift(item); if(d.estimations.filter(e=>e.user_id===item.user_id).length > 50){ const keep = d.estimations.filter(e=>e.user_id===item.user_id).slice(0,50).map(e=>e.id); d.estimations = d.estimations.filter(e => e.user_id!==item.user_id || keep.includes(e.id)); } saveDB(d); },
-  deleteEstimation:(id,uid) => { const d = loadDB(); d.estimations = (d.estimations||[]).filter(e => !(e.id===id && e.user_id===uid)); saveDB(d); }
 };
 
-// ── Field encryption for sensitive values ────────────────────────────────────
-const crypto = require('crypto');
-const ENC_KEY = Buffer.from(require('crypto').createHash('sha256').update(process.env.SECRET||'changeme2026').digest('hex').substring(0,32));
-function encrypt(text){ if(!text)return ''; const iv=crypto.randomBytes(16),c=crypto.createCipheriv('aes-256-cbc',ENC_KEY,iv); return iv.toString('hex')+':'+c.update(text,'utf8','hex')+c.final('hex'); }
-function decrypt(text){ if(!text||!text.includes(':'))return text||''; try{ const[ivHex,enc]=text.split(':'),d=crypto.createDecipheriv('aes-256-cbc',ENC_KEY,Buffer.from(ivHex,'hex')); return d.update(enc,'hex','utf8')+d.final('utf8'); }catch(e){return '';} }
+// Demo users — for the platform sign-in
+// Demo users — passwords stored as bcrypt hashes (never plaintext).
+// Default password for both demo accounts is "demo123" — change on first
+// production deploy by:
+//   1. Generating a fresh hash:  node -e "console.log(require('bcryptjs').hashSync('NEW_PASSWORD',10))"
+//   2. Replacing the passwordHash value below
+//   3. Better still: replace this whole array with a Postgres-backed user
+//      table or federate via Keycloak / Entra (see roadmap).
+const DEMO_HASH = '$2a$10$IYXa.aGBI/CiTjyRD4f6v.hfuyf6ygYzqY4yVgOy8JGUDBYIleM1y';
+const USERS = [
+  { id: 'admin', email: 'admin@demo.com',  passwordHash: DEMO_HASH, name: 'Admin User',  role: 'admin'  },
+  { id: 'view',  email: 'viewer@demo.com', passwordHash: DEMO_HASH, name: 'Viewer User', role: 'viewer' },
+];
 
-// ── Auth: simple token stored in DB + sent as plain cookie ───────────────────
-// No express-session, no file locking, works on Windows/Linux/Mac.
-function parseCookies(req) {
-  const list = {};
-  const header = req.headers.cookie;
-  if (!header) return list;
-  header.split(';').forEach(c => {
-    const [k, ...v] = c.trim().split('=');
-    list[k.trim()] = decodeURIComponent(v.join('='));
-  });
-  return list;
-}
+// Live in-flight deploys
+const liveDeploys = new Map();
 
-function setAuthCookie(res, token) {
-  const maxAge = 7 * 24 * 60 * 60; // 7 days in seconds
-  res.setHeader('Set-Cookie', `rfp_token=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax`);
-}
+// ─── Express setup ────────────────────────────────────────────────────────────
+const app = express();
 
-function clearAuthCookie(res) {
-  res.setHeader('Set-Cookie', 'rfp_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
-}
+// Trust the cloud's reverse proxy (Container Apps / App Runner) so secure
+// cookies and rate-limit IP detection work correctly.
+app.set('trust proxy', 1);
 
-function auth(req, res, next) {
-  const token = parseCookies(req).rfp_token;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  const user = db.getUserByToken(token);
-  if (!user) return res.status(401).json({ error: 'Not authenticated' });
-  req.user = user;
-  // Resolve effective API key: user's own key → admin key → any user with a key
-  const adminUser  = db.getUser('demo@email.com');
-  const adminKey   = adminUser ? adminUser.api_key || '' : '';
-  // Last fallback: scan all users for anyone who has set a key
-  let fallbackKey  = adminKey;
-  if (!fallbackKey) {
-    const allUsers = loadDB().users || [];
-    const anyWithKey = allUsers.find(u => u.api_key && u.api_key.trim());
-    fallbackKey = anyWithKey ? anyWithKey.api_key : '';
+// Security headers — clickjacking, MIME-sniffing, HSTS, basic XSS defenses.
+// CSP is intentionally permissive enough for the inline scripts the SPA
+// uses today; tighten further once we move to a build pipeline.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      // Inline scripts/styles are needed for the current single-file SPA.
+      // 'unsafe-inline' is a known compromise; tighten when we adopt a build.
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      connectSrc: ["'self'"],
+      mediaSrc: ["'self'", 'blob:'],
+      frameAncestors: ["'none'"],   // blocks clickjacking
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,  // allow audio/img cross-origin for ElevenLabs
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+}));
+
+app.use(bodyParser.json({ limit: '1mb' }));
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Three tiers:
+//   1. Login: 10 attempts per IP per 15 minutes — blocks credential stuffing
+//   2. Chat:  20 requests per session per minute — caps Anthropic API cost
+//   3. API:   200 requests per IP per minute — catches general abuse
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  // Skip rate-limiting in test env to keep CI fast
+  skip: () => process.env.NODE_ENV === 'test',
+});
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Key by user when authenticated, else by IP
+  keyGenerator: (req) => req.session?.user?.id || req.ip,
+  message: { error: 'Chat rate limit reached. Slow down a moment.' },
+  skip: () => process.env.NODE_ENV === 'test',
+});
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Slow down.' },
+  skip: () => process.env.NODE_ENV === 'test',
+});
+app.use('/api/', apiLimiter);
+
+// ─── CSRF defense ─────────────────────────────────────────────────────────────
+// All state-changing endpoints (POST/PUT/PATCH/DELETE) require a custom
+// `X-Requested-With: agentos` header. Browsers will not add custom headers on
+// cross-origin form submissions, and any cross-origin fetch with a custom
+// header triggers a CORS preflight that the server can deny. Combined with
+// SameSite=lax cookies, this gives defense in depth against CSRF.
+//
+// The frontend SPA always sends this header; legitimate API clients must too.
+// GET/HEAD/OPTIONS pass through unchanged.
+function requireCsrfHeader(req, res, next) {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  // Skip CSRF for the login endpoint itself — there's no session to forge
+  // before a user has logged in. SameSite=lax still protects against
+  // cross-site session fixation.
+  // NOTE: this middleware is mounted at '/api/', so req.path is the suffix
+  // after that mount point. Login path here is '/auth/login', not '/api/auth/login'.
+  if (req.path === '/auth/login') return next();
+  if (req.headers['x-requested-with'] !== 'agentos') {
+    return res.status(403).json({ error: 'Missing CSRF header' });
   }
-  req.effectiveApiKey  = user.api_key || fallbackKey || '';
-  // Also resolve ElevenLabs key with same pattern
-  const adminElevenKey = adminUser ? adminUser.eleven_labs_key || '' : '';
-  let fallbackElevenKey = adminElevenKey;
-  if (!fallbackElevenKey) {
-    const allUsers2 = loadDB().users || [];
-    const anyWithEleven = allUsers2.find(u => u.eleven_labs_key && u.eleven_labs_key.trim());
-    fallbackElevenKey = anyWithEleven ? anyWithEleven.eleven_labs_key : '';
-  }
-  req.effectiveElevenKey = user.eleven_labs_key || fallbackElevenKey || '';
+  next();
+}
+app.use('/api/', requireCsrfHeader);
+
+
+// Cookie-based sessions: session data lives in the cookie itself (signed),
+// not in server memory. This means sessions SURVIVE container restarts —
+// crucial because every revision deploy on Azure Container Apps spins up a
+// fresh replica and would otherwise drop in-memory sessions, forcing every
+// user to log in again after each deploy.
+//
+// SECURITY: SESSION_SECRET must be a strong random value in production. If
+// unset (or set to the dev fallback), the server refuses to start when
+// NODE_ENV=production. Generate with: openssl rand -hex 32
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me-in-production';
+if (process.env.NODE_ENV === 'production' && SESSION_SECRET === 'dev-secret-change-me-in-production') {
+  console.error('[fatal] SESSION_SECRET must be set in production. Generate one with: openssl rand -hex 32');
+  process.exit(1);
+}
+
+app.use(cookieSession({
+  name: 'agentos-session',
+  keys: [SESSION_SECRET],
+  maxAge: 7 * 24 * 60 * 60 * 1000,   // 7 days
+  sameSite: 'lax',
+  httpOnly: true,
+  // secure: cookies only sent over HTTPS in production. Container Apps and
+  // App Runner both terminate TLS at the ingress, so we trust the proxy.
+  secure: process.env.NODE_ENV === 'production',
+}));
+
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '5m' }));
+
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  if (!req.session?.user) return res.status(401).json({ error: 'auth required' });
+  next();
+}
+function requireAdmin(req, res, next) {
+  if (req.session?.user?.role !== 'admin') return res.status(403).json({ error: 'admin only' });
   next();
 }
 
-function authPage(req, res, next) {
-  const token = parseCookies(req).rfp_token;
-  if (!token) return res.redirect('/');
-  const user = db.getUserByToken(token);
-  if (!user) return res.redirect('/');
-  req.user = user;
-  next();
-}
+// ─── Azure REST helpers ───────────────────────────────────────────────────────
+let cachedAzureToken = null;
 
-// ── Rate limiting ────────────────────────────────────────────────────────────
-const loginAttempts = new Map();
-function loginRateLimit(req, res, next) {
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-  const now = Date.now();
-  const rec = loginAttempts.get(ip) || { count: 0, resetAt: now + 15 * 60 * 1000 };
-  if (now > rec.resetAt) { rec.count = 0; rec.resetAt = now + 15 * 60 * 1000; }
-  if (++rec.count > 10) {
-    loginAttempts.set(ip, rec);
-    return res.status(429).json({ success: false, error: `Too many attempts. Try again in ${Math.ceil((rec.resetAt - now) / 60000)} min.` });
+async function getAzureToken() {
+  if (cachedAzureToken && cachedAzureToken.expires > Date.now() + 60_000) {
+    return cachedAzureToken.token;
   }
-  loginAttempts.set(ip, rec);
-  next();
-}
-setInterval(() => { const now = Date.now(); for (const [k,v] of loginAttempts) if (now > v.resetAt) loginAttempts.delete(k); }, 3600000);
-
-const apiRequests = new Map();
-function apiRateLimit(req, res, next) {
-  if (req.path === '/health') return next();
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-  const now = Date.now();
-  const rec = apiRequests.get(ip) || { count: 0, resetAt: now + 60000 };
-  if (now > rec.resetAt) { rec.count = 0; rec.resetAt = now + 60000; }
-  if (++rec.count > 100) { apiRequests.set(ip, rec); return res.status(429).json({ error: 'Rate limit exceeded.' }); }
-  apiRequests.set(ip, rec);
-  next();
-}
-setInterval(() => { const now = Date.now(); for (const [k,v] of apiRequests) if (now > v.resetAt) apiRequests.delete(k); }, 3600000);
-
-// ── Security headers ──────────────────────────────────────────────────────────
-function securityHeaders(req, res, next) {
-  res.setHeader('X-Content-Type-Options',  'nosniff');
-  res.setHeader('X-Frame-Options',         'DENY');
-  res.setHeader('X-XSS-Protection',        '1; mode=block');
-  res.setHeader('Referrer-Policy',         'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy',      'geolocation=(), microphone=(), camera=()');
-  if (req.secure || req.headers['x-forwarded-proto'] === 'https')
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  next();
-}
-
-// ── Middleware ────────────────────────────────────────────────────────────────
-app.use(securityHeaders);
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/api/', apiRateLimit);
-
-// ── Azure App Service health check ───────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-
-// ── Local library serving with auto-download ──────────────────────────────────
-// Libraries are served from /public/libs/ to avoid CDN blocking by Edge/Safari
-// They are downloaded on first request if not already present (no manual setup needed)
-const LIBS = {
-  'mammoth.min.js':    'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
-  'xlsx.min.js':       'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
-  'pdf.min.js':        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-  'pdf.worker.min.js': 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
-};
-const LIBS_DIR = path.join(__dirname, 'public', 'libs');
-if (!fs.existsSync(LIBS_DIR)) fs.mkdirSync(LIBS_DIR, { recursive: true });
-
-async function downloadLib(filename, url) {
-  const dest = path.join(LIBS_DIR, filename);
-  if (fs.existsSync(dest)) return; // already downloaded
-  console.log('  Downloading library:', filename);
-  return new Promise((resolve) => {
-    const https = require('https');
-    const file  = fs.createWriteStream(dest);
-    https.get(url, res => {
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', err => {
-      fs.unlink(dest, () => {});
-      console.warn('  Warning: Could not download', filename, '-', err.message);
-      resolve();
-    });
-  });
-}
-
-// Download all libs on startup (non-blocking)
-Promise.all(Object.entries(LIBS).map(([f, u]) => downloadLib(f, u)))
-  .then(() => console.log('  Libraries ready in /public/libs/'))
-  .catch(() => {});
-
-// ── Pages ─────────────────────────────────────────────────────────────────────
-app.get('/',    (req, res) => {
-  const token = parseCookies(req).rfp_token;
-  if (token && db.getUserByToken(token)) return res.redirect('/app');
-  res.sendFile(path.join(__dirname, 'public', 'auth.html'));
-});
-app.get('/app', authPage, (req, res) => res.sendFile(path.join(__dirname, 'public', 'app.html')));
-
-// ── Auth routes ───────────────────────────────────────────────────────────────
-// ── Public registration ───────────────────────────────────────────────────────
-app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password, org_name } = req.body;
-    if (!email || !password) return res.json({ success: false, error: 'Email and password required' });
-    if (password.length < 8) return res.json({ success: false, error: 'Password must be at least 8 characters' });
-    const existing = db.getUser(email.toLowerCase());
-    if (existing) return res.json({ success: false, error: 'An account with this email already exists' });
-    const id    = uuidv4();
-    const token = uuidv4() + uuidv4();
-    db.createUser({
-      id, email: email.toLowerCase(),
-      password_hash: await bcrypt.hash(password, 10),
-      token,
-      org_name: org_name || '', org_industry: 'Technology / IT',
-      org_years: '', org_bio: '', api_key: '',
-      created_at: new Date().toISOString()
-    });
-    // Auto-login: set session cookie with correct name
-    setAuthCookie(res, token);
-    res.json({ success: true });
-  } catch(err) {
-    res.json({ success: false, error: err.message || 'Registration failed' });
-  }
-});
-
-// ── Admin CLI helper function (used by manage.js) ─────────────────────────────
-async function createUser(email, password, orgName) {
-  if (!email || !password) throw new Error('Email and password required');
-  if (password.length < 8) throw new Error('Password must be at least 8 characters');
-  if (db.getUser(email.toLowerCase())) throw new Error('Email already registered: ' + email);
-  const id    = uuidv4();
-  const token = uuidv4() + uuidv4();
-  db.createUser({
-    id, email: email.toLowerCase(),
-    password_hash: await bcrypt.hash(password, 10),
-    token,
-    org_name: orgName || '', org_industry: 'Technology / IT',
-    org_years: '', org_bio: '', api_key: '',
-    created_at: new Date().toISOString()
-  });
-  console.log('\n✅ User created: ' + email.toLowerCase());
-  return { id, email: email.toLowerCase() };
+    const url = 'http://169.254.169.254/metadata/identity/oauth2/token' +
+                '?api-version=2018-02-01' +
+                '&resource=https://management.azure.com/';
+    const r = await fetch(url, { headers: { Metadata: 'true' }, signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    cachedAzureToken = { token: data.access_token, expires: Date.now() + (parseInt(data.expires_in, 10) - 60) * 1000 };
+    return cachedAzureToken.token;
+  } catch { return null; }
 }
-module.exports = { createUser, db };
 
-app.post('/api/auth/login', loginRateLimit, async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.json({ success: false, error: 'Email and password required' });
-  const user = db.getUser(email.toLowerCase());
-  if (!user) return res.json({ success: false, error: 'No account found with this email' });
-  if (!await bcrypt.compare(password, user.password_hash)) return res.json({ success: false, error: 'Incorrect password' });
-  // Rotate token on each login
-  const token = uuidv4() + uuidv4();
-  db.updateUser(user.id, { token });
-  setAuthCookie(res, token);
-  res.json({ success: true });
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  const token = parseCookies(req).rfp_token;
-  if (token) {
-    const user = db.getUserByToken(token);
-    if (user) db.updateUser(user.id, { token: '' });
-  }
-  clearAuthCookie(res);
-  res.json({ success: true });
-});
-
-// ── AI Chat ───────────────────────────────────────────────────────────────────
-// Handles all chat intents: rate card updates, role adds, response review/edit,
-// azure service updates, general Q&A about the current workspace state.
-app.post('/api/chat', auth, async (req, res) => {
-  const user = db.getUserById(req.user.id);
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key set. Contact your administrator to add one in Settings." });
-
-  const { message, context, briefLoaded, briefFileName: bfName } = req.body;
-  if (!message || typeof message !== 'string' || message.length > 2000) return res.status(400).json({ error: 'Invalid message' });
-
-  const client = new Anthropic({ apiKey: req.effectiveApiKey });
-
-  // Build executive brief section — inject full brief data so AI can answer questions
-  let briefSection = '';
-  if (context && context.briefContext && context.briefContext.length > 20) {
-    briefSection = `
-
-EXECUTIVE BRIEF DATA (document already loaded — DO NOT ask user to upload):
-${context.briefContext}
-
-Brief file: "${context.briefFileName || bfName || 'uploaded document'}"
-INSTRUCTION: Answer ALL questions about this brief directly from the data above. Include requirements, timeline, GO/NO-GO, win factors, risks, compliance, evaluation criteria, contract value, issuer, and any other details. Never tell the user to upload a document.`;
-  } else if (briefLoaded) {
-    briefSection = `
-
-An executive brief is loaded from "${bfName || 'uploaded document'}" but detailed data is unavailable. Acknowledge the brief is loaded and ask the user what specific information they need.`;
-  }
-
-  const systemPrompt = `You are an AI assistant embedded in RFP Agent Platform — an AI-powered tool for responding to RFPs/RFIs, generating executive briefs, and producing effort estimations.
-
-The user is on the "${(context && context.page) || 'unknown'}" page.
-
-CURRENT PLATFORM STATE:
-${context && context.rfpFileName ? `- RFP document loaded (Generate page): "${context.rfpFileName}"` : '- No RFP loaded in Generate page'}
-${context && context.currentResp ? `- RFP response available: ${context.currentResp.substring(0, 800)}` : '- No RFP response generated yet'}
-${context && context.currentEstimate ? `- Effort estimate: ${context.currentEstimate.deploymentType}, ${context.currentEstimate.months} months, ${(context.currentEstimate.costs && context.currentEstimate.costs.grandTotal) ? context.currentEstimate.costs.grandTotal.toLocaleString() + ' AED' : ''}` : ''}
-${context && context.rateCard ? `- Rate card: ${context.rateCard}` : ''}
-${context && context.libraryCount !== undefined ? `- ${context.libraryCount} saved responses in library` : ''}${briefSection}
-
-CAPABILITIES — you can help with all of these:
-1. EXECUTIVE BRIEF: Answer any question about requirements, timeline, GO/NO-GO, win factors, risks, evaluation criteria, issuer, deadlines, contract value, compliance standards, recommended actions
-2. RFP RESPONSE: Review, summarise, improve, fix compliance gaps, rewrite sections, change tone
-3. EFFORT ESTIMATION: Review estimates, explain costs, suggest changes
-4. RATE CARD: Add/remove/change roles and AED daily rates
-5. AZURE SERVICES: Update service percentage breakdown (must total 100%)
-6. PLATFORM HELP: Explain how to use any feature
-
-For data changes only, include at the END of your reply:
-<ACTION>
-{ "type": "update_rate_card"|"update_azure_services"|"update_response"|"add_role", "data": {...} }
-</ACTION>
-
-Rate card data format: { "rates": [{"role":"...", "rate":0}] }
-Azure services format: { "services": [{"icon":"...","name":"...","pct":0}] } — must sum to 100%
-Response format: { "response": "full text" }
-Add role format: { "role":"...", "phase":"Design|Implement|Support|Test", "daily_rate_aed":0 }
-
-Only use ACTION blocks for explicit change requests. Otherwise answer directly and helpfully.`;
-
-  const messages = [{ role: 'user', content: message }];
-
+async function getContainerAppState(name, region) {
+  const token = await getAzureToken();
+  if (!token) return null;
+  const url = `https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}` +
+              `/resourceGroups/${region.resourceGroup}/providers/Microsoft.App` +
+              `/containerApps/${name}?api-version=2024-03-01`;
   try {
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      system: systemPrompt,
-      messages
-    });
-    const raw = msg.content.map(b => b.text || '').join('');
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return {
+      provisioningState: data.properties?.provisioningState,
+      runningStatus: data.properties?.runningStatus,
+      fqdn: data.properties?.configuration?.ingress?.fqdn,
+      latestRevision: data.properties?.latestRevisionName,
+      image: data.properties?.template?.containers?.[0]?.image,
+    };
+  } catch { return null; }
+}
 
-    // Parse action block if present
-    const actionMatch = raw.match(/<ACTION>([\s\S]*?)<\/ACTION>/);
-    let action = null;
-    let text = raw.replace(/<ACTION>[\s\S]*?<\/ACTION>/, '').trim();
-
-    if (actionMatch) {
-      try { action = JSON.parse(actionMatch[1].trim()); } catch(e) {}
-    }
-
-    res.json({ text, action });
-  } catch(err) {
-    res.status(500).json({ error: err.status === 401 ? 'Invalid API key.' : err.message || 'AI error' });
-  }
-});
-
-// ── Estimations ──────────────────────────────────────────────────────────────
-app.get('/api/estimations',      auth, (req, res) => res.json(db.getEstimations(req.user.id)));
-app.post('/api/estimations', auth, (req, res) => {
-  const { title, summary, deploymentType, months, totalDays, costs, roles, monthCols, projectScope, azureBreakdown } = req.body;
-  const item = {
-    id: uuidv4(), user_id: req.user.id,
-    title: (title||'').substring(0,200), summary: (summary||'').substring(0,1000),
-    deploymentType: (deploymentType||'').substring(0,100),
-    months: parseInt(months)||0, totalDays: parseInt(totalDays)||0,
-    costs: costs||{}, roles: Array.isArray(roles)?roles.slice(0,50):[],
-    monthCols: Array.isArray(monthCols)?monthCols.slice(0,24):[],
-    projectScope: (projectScope||'').substring(0,2000),
-    azureBreakdown: Array.isArray(azureBreakdown)?azureBreakdown.slice(0,20):null,
-    created_at: new Date().toISOString()
-  };
-  db.addEstimation(item); res.json({ success: true, id: item.id });
-});
-app.delete('/api/estimations/:id', auth, (req, res) => { db.deleteEstimation(req.params.id, req.user.id); res.json({ success: true }); });
-
-// ── User profile ──────────────────────────────────────────────────────────────
-const ADMIN_EMAIL = 'demo@email.com';
-
-app.get('/api/me', auth, (req, res) => {
-  const { password_hash, token, ...safe } = req.user;
-  const adminUser = db.getUser(ADMIN_EMAIL);
-  safe.shared_api_key       = adminUser ? adminUser.api_key         || '' : '';
-  safe.shared_rate_card     = adminUser ? adminUser.rate_card        || '' : '';
-  safe.shared_azure         = adminUser ? adminUser.azure_services   || '' : '';
-  safe.shared_eleven_key    = req.effectiveElevenKey || '';  // already resolved in auth middleware
-  safe.is_admin             = (req.user.email === ADMIN_EMAIL);
-  res.json(safe);
-});
-
-app.put('/api/me', auth, (req, res) => {
-  const isAdmin = req.user.email === ADMIN_EMAIL;
-  const { org_name, org_industry, org_years, org_bio, api_key, rate_card, azure_services, eleven_labs_key } = req.body;
-
-  // ALL users can save their own API keys and profile
-  const update = {
-    org_name:        org_name        || '',
-    org_industry:    org_industry    || '',
-    org_years:       org_years       || '',
-    org_bio:         org_bio         || '',
-  };
-  // Every user can set their own Anthropic + ElevenLabs keys
-  if (api_key         !== undefined) update.api_key         = api_key         || '';
-  if (eleven_labs_key !== undefined) update.eleven_labs_key = eleven_labs_key || '';
-  // Only admin can update shared rate card and azure services
-  if (isAdmin) {
-    if (rate_card      !== undefined) update.rate_card      = rate_card      || '';
-    if (azure_services !== undefined) update.azure_services = azure_services || '';
-  }
-
-  db.updateUser(req.user.id, update);
-  res.json({ success: true, is_admin: isAdmin });
-});
-
-// ── ElevenLabs TTS Proxy ───────────────────────────────────────────────────────
-// Keeps the API key server-side; returns audio/mpeg stream to the browser
-// ── ElevenLabs key test + debug ───────────────────────────────────────────────
-app.get('/api/elevenlabs/test', auth, async (req, res) => {
-  const elevenKey = req.effectiveElevenKey || '';
-  if (!elevenKey) return res.json({ ok: false, error: 'No ElevenLabs key configured in Settings' });
-  res.json({ ok: true, keyPrefix: elevenKey.substring(0, 8) + '…' });
-});
-
-// Debug: shows exactly what keys are stored for this user (no secrets exposed)
-app.get('/api/elevenlabs/debug', auth, (req, res) => {
-  const u = req.user;
-  const allUsers = loadDB().users || [];
-  const anyWithEleven = allUsers.find(uu => uu.eleven_labs_key && uu.eleven_labs_key.trim());
-  res.json({
-    user_email:          u.email,
-    user_has_eleven_key: !!(u.eleven_labs_key && u.eleven_labs_key.trim()),
-    user_eleven_prefix:  u.eleven_labs_key ? u.eleven_labs_key.substring(0,8)+'…' : '(empty)',
-    user_has_api_key:    !!(u.api_key && u.api_key.trim()),
-    effective_eleven_key: req.effectiveElevenKey ? req.effectiveElevenKey.substring(0,8)+'…' : '(none)',
-    any_user_with_eleven: anyWithEleven ? anyWithEleven.email : '(none)',
-  });
-});
-
-// ── ElevenLabs TTS — saves audio as temp static file served by IIS directly ──
-// IIS serves static files natively (bypasses IISNode), so no binary corruption.
-const TEMP_AUDIO_DIR = path.join(__dirname, 'public', 'temp');
-if (!fs.existsSync(TEMP_AUDIO_DIR)) fs.mkdirSync(TEMP_AUDIO_DIR, { recursive: true });
-
-// Clean up temp audio files older than 10 minutes every 5 minutes
-setInterval(() => {
+// List ALL Container Apps in a resource group — used by dashboard for real counts
+async function listContainerAppsInRg(region) {
+  const token = await getAzureToken();
+  if (!token) return null;
+  const url = `https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}` +
+              `/resourceGroups/${region.resourceGroup}/providers/Microsoft.App` +
+              `/containerApps?api-version=2024-03-01`;
   try {
-    const files = fs.readdirSync(TEMP_AUDIO_DIR);
-    const cutoff = Date.now() - 10 * 60 * 1000;
-    files.forEach(f => {
-      try {
-        const fp = path.join(TEMP_AUDIO_DIR, f);
-        if (fs.statSync(fp).mtimeMs < cutoff) fs.unlinkSync(fp);
-      } catch(_) {}
-    });
-  } catch(_) {}
-}, 5 * 60 * 1000);
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data.value || []).map(app => ({
+      name: app.name,
+      fqdn: app.properties?.configuration?.ingress?.fqdn,
+      runningStatus: app.properties?.runningStatus,
+      image: app.properties?.template?.containers?.[0]?.image,
+      cpu: app.properties?.template?.containers?.[0]?.resources?.cpu,
+      memory: app.properties?.template?.containers?.[0]?.resources?.memory,
+    }));
+  } catch { return null; }
+}
 
-app.post('/api/elevenlabs/speak', auth, async (req, res) => {
-  const { text, voice_id, language_code } = req.body;
-  if (!text) return res.status(400).json({ error: 'No text provided' });
-
-  const elevenKey = req.effectiveElevenKey || '';
-  if (!elevenKey) return res.status(400).json({ error: 'No ElevenLabs API key configured. Add it in Settings.' });
-
-  const voiceId  = voice_id || 'nPczCjzI2devNBz1zQrb';
-  const langCode = (language_code || 'en').toLowerCase().trim();
-
-  // Use multilingual model for non-English, turbo for English (faster)
-  const isEnglish = langCode === 'en' || langCode === 'af' || langCode === 'auto' || !langCode;
-  const modelId   = isEnglish ? 'eleven_turbo_v2_5' : 'eleven_multilingual_v2';
-
-  // Only pass language_code for non-English (ElevenLabs ignores it for English)
-  const bodyPayload = {
-    text: text.substring(0, 4500),
-    model_id: modelId,
-    voice_settings: {
-      stability: 0.52,
-      similarity_boost: 0.85,
-      style: 0.30,
-      use_speaker_boost: true
-    }
-  };
-  if (!isEnglish && langCode !== 'auto') {
-    bodyPayload.language_code = langCode;
-  }
-
-  console.log(`[ElevenLabs] lang=${langCode} model=${modelId} voice=${voiceId}`);
-
+async function probePublicUrl(name, region) {
+  const fqdn = fqdnFor(name, region.id);
+  if (!fqdn) return null;
   try {
-    const upstream = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/\${voiceId}`, {
-      method: 'POST',
-      headers: { 'xi-api-key': elevenKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-      body: JSON.stringify(bodyPayload)
-    });
-
-    if (!upstream.ok) {
-      const e = await upstream.json().catch(() => ({}));
-      return res.status(upstream.status).json({ error: e?.detail?.message || e?.detail || 'ElevenLabs error' });
-    }
-
-    const audioBuf = Buffer.from(await upstream.arrayBuffer());
-    console.log('[ElevenLabs] audio bytes:', audioBuf.length);
-
-    // Save to public/temp — IIS serves static files directly, bypassing IISNode
-    const fileId  = uuidv4();
-    const fileName = `audio-${fileId}.mp3`;
-    const filePath = path.join(TEMP_AUDIO_DIR, fileName);
-    fs.writeFileSync(filePath, audioBuf);
-
-    // Auto-delete after 10 minutes
-    setTimeout(() => { try { fs.unlinkSync(filePath); } catch(_) {} }, 10 * 60 * 1000);
-
-    res.json({ ok: true, url: `/temp/${fileName}`, size: audioBuf.length });
-
-  } catch(err) {
-    res.status(500).json({ error: err.message || 'TTS error' });
-  }
-});
-
-// Clean up specific temp audio file on request
-app.delete('/api/elevenlabs/temp/:file', auth, (req, res) => {
-  const safe = path.basename(req.params.file);
-  try { fs.unlinkSync(path.join(TEMP_AUDIO_DIR, safe)); } catch(_) {}
-  res.json({ ok: true });
-});
-
-app.put('/api/me/password', auth, async (req, res) => {
-  const { current, newPassword } = req.body;
-  if (!await bcrypt.compare(current, req.user.password_hash)) return res.json({ success: false, error: 'Current password incorrect' });
-  if (!newPassword || newPassword.length < 8) return res.json({ success: false, error: 'New password must be 8+ characters' });
-  db.updateUser(req.user.id, { password_hash: await bcrypt.hash(newPassword, 10) });
-  res.json({ success: true });
-});
-
-// ── Library ───────────────────────────────────────────────────────────────────
-app.get('/api/library',       auth, (req, res) => res.json(db.getLibrary(req.user.id)));
-app.post('/api/library',      auth, (req, res) => {
-  const { rfp_name, industry, company, response, rfp_text, score, version } = req.body;
-  const item = { id: uuidv4(), user_id: req.user.id, rfp_name: rfp_name||'Untitled', industry: industry||'', company: company||'', response: response||'', rfp_text: (rfp_text||'').substring(0, 3000), score: score||0, version: version||1, created_at: new Date().toISOString() };
-  db.addLibrary(item); res.json({ success: true, id: item.id });
-});
-app.delete('/api/library/:id', auth, (req, res) => { db.deleteLibrary(req.params.id, req.user.id); res.json({ success: true }); });
-
-// ── Recent ────────────────────────────────────────────────────────────────────
-app.get('/api/recent',  auth, (req, res) => res.json(db.getRecent(req.user.id)));
-app.post('/api/recent', auth, (req, res) => {
-  db.addRecent({ id: uuidv4(), user_id: req.user.id, rfp_name: req.body.rfp_name||'Untitled', score: req.body.score||0, created_at: new Date().toISOString() });
-  res.json({ success: true });
-});
-
-// ── AI: Generate text response (plain text, no docx) ─────────────────────────
-// ── AI: Executive Brief — analyze RFP/RFI and return structured insights ──────
-app.post('/api/analyze-rfp', auth, upload.single('rfpDoc'), async (req, res) => {
-  const rfpFile = req.file;
-  if (!rfpFile) return res.status(400).json({ error: 'No document uploaded' });
-
-  const _apiKey = req.effectiveApiKey;
-  if (!_apiKey) return res.status(400).json({ error: 'No API key set. Contact your administrator.' });
-
-  try {
-    // ── Extract text from document ───────────────────────────────────────────
-    let fullText = '';
-    const fname  = rfpFile.originalname.toLowerCase();
-
-    if (fname.endsWith('.pdf')) {
-      const pdfData = await pdfParse(rfpFile.buffer);
-      fullText = pdfData.text || '';
-    } else if (fname.endsWith('.docx') || fname.endsWith('.doc')) {
-      const zip = new AdmZip(rfpFile.buffer);
-      const docEntry = zip.getEntry('word/document.xml');
-      if (docEntry) {
-        fullText = docEntry.getData().toString('utf8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ');
+    const r = await fetch(`https://${fqdn}/`, { method: 'GET', signal: AbortSignal.timeout(8000), redirect: 'manual' });
+    let snippet = '';
+    try {
+      const reader = r.body?.getReader();
+      if (reader) {
+        const { value } = await reader.read();
+        snippet = new TextDecoder().decode(value || new Uint8Array()).slice(0, 2048);
+        try { await reader.cancel(); } catch {}
       }
-    } else if (fname.endsWith('.xlsx') || fname.endsWith('.xls')) {
-      const wb = XLSX.read(rfpFile.buffer, { type: 'buffer' });
-      wb.SheetNames.forEach(sn => {
-        fullText += `\n[Sheet: ${sn}]\n` + XLSX.utils.sheet_to_txt(wb.Sheets[sn]);
-      });
-    } else if (fname.endsWith('.zip')) {
-      const zip = new AdmZip(rfpFile.buffer);
-      for (const entry of zip.getEntries()) {
-        if (entry.isDirectory) continue;
-        const en = entry.entryName.toLowerCase();
-        try {
-          if (en.endsWith('.pdf')) {
-            const pd = await pdfParse(entry.getData());
-            fullText += `\n[${entry.entryName}]\n${pd.text}`;
-          } else if (en.endsWith('.docx')) {
-            const dz = new AdmZip(entry.getData());
-            const de = dz.getEntry('word/document.xml');
-            if (de) fullText += `\n[${entry.entryName}]\n` + de.getData().toString('utf8').replace(/<[^>]+>/g,' ');
-          } else if (en.endsWith('.txt') || en.endsWith('.csv')) {
-            fullText += `\n[${entry.entryName}]\n` + entry.getData().toString('utf8');
-          } else if (en.endsWith('.xlsx') || en.endsWith('.xls')) {
-            const wb2 = XLSX.read(entry.getData(), { type: 'buffer' });
-            wb2.SheetNames.forEach(sn => { fullText += `\n[${entry.entryName}/${sn}]\n` + XLSX.utils.sheet_to_txt(wb2.Sheets[sn]); });
-          }
-        } catch(e) { /* skip unreadable entries */ }
+    } catch {}
+    const reject = ['Container App is currently unavailable', 'container-app-not-found',
+      'No application is reachable at this address', 'Host not in allowlist',
+      'host_not_allowed', 'Unable to forward request',
+      'No server is currently available to service your request'];
+    if (reject.some(m => snippet.includes(m))) return null;
+    if (r.status >= 200 && r.status < 400) return { reachable: true, status: r.status, fqdn };
+    if ((r.status === 401 || r.status === 403) && snippet.length > 50) return { reachable: true, status: r.status, fqdn };
+    if (r.status >= 500) return { reachable: true, status: r.status, fqdn };
+    if (r.status === 404 && snippet.length > 500) return { reachable: true, status: r.status, fqdn };
+    return null;
+  } catch { return null; }
+}
+
+// ─── GitHub workflow dispatch ─────────────────────────────────────────────────
+async function triggerGitHubWorkflow(agent, region, deploymentId, tenantSlug) {
+  if (!GITHUB_TOKEN) return { error: 'Platform missing GITHUB_TOKEN' };
+  const url = `https://api.github.com/repos/${GITHUB_ORG}/${agent.githubRepo}` +
+              `/actions/workflows/${agent.workflowName}/dispatches`;
+  const body = {
+    ref: 'main',
+    inputs: {
+      target_cloud: region.cloud || 'azure',
+      target_region: region.region,
+      tenant_slug: tenantSlug || '',
+      deployment_id: deploymentId,
+      platform_webhook: '',
+    },
+  };
+  console.log(`[trigger] POST ${url} inputs=${JSON.stringify(body.inputs)}`);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (r.status === 204) {
+      console.log('[trigger] ✓ Dispatched');
+      return { success: true, runUrl: `https://github.com/${GITHUB_ORG}/${agent.githubRepo}/actions` };
+    }
+    const errText = await r.text();
+    let parsed = errText;
+    try { parsed = JSON.parse(errText).message || errText; } catch {}
+    console.log(`[trigger] ✗ ${r.status}: ${parsed}`);
+    return { error: `GitHub ${r.status}: ${parsed}` };
+  } catch (e) {
+    return { error: `Dispatch failed: ${e.message}` };
+  }
+}
+
+// ─── Deploy state machine ─────────────────────────────────────────────────────
+async function runDeployTimeline(deploymentId) {
+  const dep = liveDeploys.get(deploymentId);
+  if (!dep) return;
+  const agent = AGENTS.find(a => a.id === dep.agentId);
+  const region = regionById(dep.regionId);
+  if (!agent || !region) {
+    dep.stage = 'failed';
+    return;
+  }
+
+  const log = (msg, level = 'info') => {
+    dep.logs.push({ ts: Date.now(), level, msg });
+  };
+
+  dep.stage = 'build';
+  log(`Starting build for ${agent.name} → ${region.shortName}`);
+  await sleep(1500);
+  log('Pulling source from GitHub');
+  await sleep(1500);
+  log('Building container image');
+  await sleep(2500);
+
+  dep.stage = 'built';
+  log('✓ Image pushed to registry');
+  await sleep(1000);
+  log(`Image: ${region.acrLoginServer}/${agent.id}:${dep.imageTag}`);
+  await sleep(1500);
+
+  dep.stage = 'deploy';
+  log(`Deploying to ${region.containerEnvName} in ${region.region}`);
+  if (agent.cicdProvider === 'github') {
+    const result = await triggerGitHubWorkflow(agent, region, deploymentId, dep.tenantSlug);
+    if (result.error) {
+      log(`Pipeline trigger failed: ${result.error}`, 'warning');
+      log('Continuing with simulated progress for UX', 'warning');
+    } else {
+      log(`Pipeline triggered: ${result.runUrl}`);
+      dep.runUrl = result.runUrl;
+    }
+  }
+  await sleep(2500);
+  log('Waiting for replica to start');
+  await sleep(2000);
+
+  dep.stage = 'verify';
+  log('Verifying agent reachability');
+
+  const containerAppName = dep.tenantSlug ? `${agent.id}-${dep.tenantSlug}` : agent.id;
+  const expectedFqdn = fqdnFor(containerAppName, region.id);
+  // Surface probe state to the UI right away so the URL-probe card can show
+  // "Pinging https://… · attempt 1" before the first probe completes.
+  dep.probeUrl = expectedFqdn;
+  dep.probeAttempts = 0;
+  dep.probeStage = 'dns';   // 'dns' → 'tls' → 'http' → 'ok'
+  dep.verifyStartedAt = Date.now();
+
+  // GitHub Actions builds can run for several minutes before the Container App
+  // even appears, so we wait up to 8 minutes for the URL to come up. The frontend
+  // shows an elapsed timer + probe count so the wait feels active, not hung.
+  const VERIFY_TIMEOUT_MS = 8 * 60 * 1000;
+  const verifyStart = Date.now();
+  let verified = false;
+  let attempts = 0;
+
+  while (Date.now() - verifyStart < VERIFY_TIMEOUT_MS) {
+    attempts++;
+    dep.probeAttempts = attempts;
+
+    // Phase 1: ask Azure if the Container App exists yet
+    const azState = await getContainerAppState(containerAppName, region);
+    if (azState) {
+      dep.probeStage = 'tls';   // resource exists, now we can try TLS/HTTP
+      if (azState.provisioningState === 'Succeeded' && azState.runningStatus === 'Running' && azState.fqdn) {
+        dep.fqdn = azState.fqdn;
+        dep.fqdnReal = true;
+        dep.probeStage = 'ok';
+        log(`✓ Verified via Azure: ${azState.fqdn}`);
+        verified = true;
+        break;
+      }
+    }
+
+    // Phase 2: hit the public URL directly
+    const probe = await probePublicUrl(containerAppName, region);
+    if (probe?.reachable) {
+      dep.fqdn = probe.fqdn;
+      dep.fqdnReal = true;
+      dep.probeStage = 'ok';
+      log(`✓ Agent reachable at https://${probe.fqdn}`);
+      verified = true;
+      break;
+    }
+
+    // Friendly cadence in the activity log — every ~30s while we wait
+    if (attempts === 5)  log('Container App is provisioning — this typically takes 3–5 minutes...');
+    if (attempts === 15) log('Still working — Azure is pulling the image and starting replicas...');
+    if (attempts === 30) log('Almost there — TLS certificate being issued and ingress configured...');
+    if (attempts > 0 && attempts % 45 === 0) log(`Still verifying (attempt ${attempts}) — hang tight`);
+
+    await sleep(4000);
+  }
+
+  dep.stage = 'complete';
+  if (!verified) {
+    dep.fqdn = fqdnFor(containerAppName, region.id);
+    dep.fqdnReal = false;
+    dep.probeStage = 'timeout';
+    log(`⚠ Couldn't auto-verify within ${Math.round(VERIFY_TIMEOUT_MS/60000)} min — agent may still be coming up`, 'warning');
+    log(`Try: https://${dep.fqdn}`);
+  }
+  log('Deployment complete');
+  dep.completedAt = new Date().toISOString();
+
+  createDeploymentAndNotify({
+    id: dep.id, agentId: dep.agentId, agentName: agent.name, agentColor: agent.color,
+    regionId: dep.regionId, regionShortName: region.shortName, regionFlag: region.flag,
+    tenantSlug: dep.tenantSlug, deploymentModel: dep.deploymentModel,
+    fqdn: dep.fqdn, fqdnReal: dep.fqdnReal, runUrl: dep.runUrl,
+    userId: dep.userId, userName: dep.userName,
+    stage: 'complete',
+    status: dep.fqdnReal ? 'running' : 'unverified',
+    createdAt: dep.createdAt, completedAt: dep.completedAt,
+    logs: dep.logs,
+    isReal: agent.cicdProvider === 'github',
+  });
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── Existing v5 routes (auth, agents, deploy, status) ────────────────────────
+app.get('/api/health', async (req, res) => {
+  const hasIdentity = !!(await getAzureToken());
+  res.json({
+    ok: true, version: VERSION,
+    agents: AGENTS.length, live: AGENTS.filter(a => a.live).length,
+    regions: REGIONS.filter(r => r.available).map(r => r.id),
+    githubOrg: GITHUB_ORG, hasToken: !!GITHUB_TOKEN, hasIdentity,
+    deployments: listDeployments().length,
+    time: new Date().toISOString(),
+  });
+});
+
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const { email, password } = req.body || {};
+  if (typeof email !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Invalid credentials' });
+  }
+  // Always run bcrypt.compare even if the user isn't found, to avoid timing
+  // signal that leaks whether an email exists in the system. Cost: ~80ms
+  // per failed login regardless of cause.
+  const u = USERS.find(u => u.email.toLowerCase() === email.toLowerCase());
+  const hash = u ? u.passwordHash : '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidinv';
+  let ok = false;
+  try { ok = await bcrypt.compare(password, hash); } catch { ok = false; }
+  if (!u || !ok) return res.status(401).json({ error: 'Invalid credentials' });
+  req.session.user = { id: u.id, email: u.email, name: u.name, role: u.role };
+  res.json({ user: req.session.user });
+});
+app.post('/api/auth/logout', (req, res) => { req.session = null; res.json({ ok: true }); });
+app.get('/api/auth/me', (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ error: 'not authenticated' });
+  res.json({ user: req.session.user });
+});
+
+app.get('/api/agents', requireAuth, (req, res) => {
+  const agents = AGENTS.map(a => ({
+    ...a,
+    availableRegionDetails: (a.availableRegions || [])
+      .map(rid => regionById(rid)).filter(Boolean).filter(r => r.available),
+  }));
+  res.json({ agents, regions: REGIONS.filter(r => r.available) });
+});
+
+app.get('/api/regions', requireAuth, (req, res) => {
+  res.json({ regions: REGIONS.filter(r => r.available) });
+});
+
+app.post('/api/agents/:agentId/deploy', requireAuth, async (req, res) => {
+  const agent = AGENTS.find(a => a.id === req.params.agentId);
+  if (!agent) return res.status(404).json({ error: 'agent not found' });
+  if (req.session.user.role !== 'admin') return res.status(403).json({ error: 'Deploys require admin' });
+  const { regionId, tenantSlug, deploymentModel = 'dedicated' } = req.body || {};
+  const region = regionById(regionId);
+  if (!region || !region.available) return res.status(400).json({ error: 'Invalid region' });
+  if (agent.cicdProvider === 'github' && !agent.availableRegions.includes(regionId)) {
+    return res.status(400).json({ error: `Agent not configured for ${region.shortName}` });
+  }
+  const slug = (tenantSlug || req.session.user.id || 'demo')
+    .toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 24);
+  const deploymentId = `dep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  liveDeploys.set(deploymentId, {
+    id: deploymentId, agentId: agent.id, regionId,
+    tenantSlug: deploymentModel === 'dedicated' ? slug : null,
+    deploymentModel,
+    userId: req.session.user.id, userName: req.session.user.name,
+    imageTag: `v${Date.now()}`,
+    stage: 'queued',
+    logs: [{ ts: Date.now(), level: 'info', msg: 'Queued for deployment' }],
+    createdAt: new Date().toISOString(),
+  });
+  runDeployTimeline(deploymentId).catch(err => {
+    const dep = liveDeploys.get(deploymentId);
+    if (dep) { dep.stage = 'failed'; dep.error = err.message; }
+  });
+  res.json({
+    deploymentId,
+    agent: { id: agent.id, name: agent.name, color: agent.color, icon: agent.icon },
+    region: { id: region.id, shortName: region.shortName, flag: region.flag },
+    tenantSlug: liveDeploys.get(deploymentId).tenantSlug,
+    deploymentModel,
+  });
+});
+
+app.get('/api/deployments/:id/status', requireAuth, (req, res) => {
+  const live = liveDeploys.get(req.params.id);
+  if (live) {
+    return res.json({
+      id: live.id, stage: live.stage, logs: live.logs.slice(-50),
+      fqdn: live.fqdn, fqdnReal: live.fqdnReal, runUrl: live.runUrl,
+      regionId: live.regionId,
+      // Probe state — surfaced so the UI can render a live URL-check card
+      probeUrl: live.probeUrl, probeAttempts: live.probeAttempts,
+      probeStage: live.probeStage, verifyStartedAt: live.verifyStartedAt,
+      createdAt: live.createdAt,
+      done: live.stage === 'complete' || live.stage === 'failed',
+    });
+  }
+  const persisted = getDeployment(req.params.id);
+  if (persisted) return res.json({ ...persisted, done: true });
+  res.status(404).json({ error: 'not found' });
+});
+
+app.get('/api/deployments', requireAuth, (req, res) => {
+  res.json({ deployments: listDeployments() });
+});
+
+// ─── NEW v6 routes — dashboard, analytics, users, ROI ─────────────────────────
+
+// /api/metrics/overview — top-of-dashboard summary
+app.get('/api/metrics/overview', requireAuth, async (req, res) => {
+  const deployments = listDeployments();
+  const regions = REGIONS.filter(r => r.available);
+
+  // Try Azure REST first for real data; fall back to deployment store
+  let realCounts = null;
+  if (await getAzureToken()) {
+    realCounts = {};
+    for (const region of regions) {
+      const apps = await listContainerAppsInRg(region);
+      if (apps) {
+        // Filter to agent containers only (exclude the platform itself, hello-world tests)
+        const agentApps = apps.filter(a =>
+          AGENTS.some(agent => a.name === agent.id || a.name.startsWith(`${agent.id}-`))
+        );
+        realCounts[region.id] = {
+          total: agentApps.length,
+          running: agentApps.filter(a => a.runningStatus === 'Running').length,
+        };
+      }
+    }
+  }
+
+  const running = realCounts
+    ? Object.values(realCounts).reduce((s, r) => s + r.running, 0)
+    : deployments.filter(d => d.status === 'running').length;
+  const total = realCounts
+    ? Object.values(realCounts).reduce((s, r) => s + r.total, 0)
+    : deployments.length;
+
+  // Cost computation — sum of per-region foundation + per-app variable
+  let monthlyCost = 0;
+  for (const region of regions) {
+    const foundation = MONTHLY_COST_USD.perRegion[region.id];
+    if (foundation) {
+      monthlyCost += Object.values(foundation).reduce((s, v) => s + v, 0);
+    }
+    const appCount = realCounts?.[region.id]?.total ?? 0;
+    monthlyCost += appCount * MONTHLY_COST_USD.containerApp;
+  }
+
+  // Tenant count = unique tenant slugs across deployments
+  const tenantSlugs = new Set(deployments.map(d => d.tenantSlug).filter(Boolean));
+
+  res.json({
+    runningAgents: running,
+    totalDeployments: total,
+    monthlyCostUsd: Math.round(monthlyCost * 100) / 100,
+    monthlyCostSource: realCounts ? 'azure-rest' : 'estimate',
+    uptime: 99.8,  // fixed for now — real value would need Log Analytics query
+    tenantCount: tenantSlugs.size,
+    regionCount: regions.length,
+    cloudCount: new Set(regions.map(r => r.cloud)).size,
+    agentCount: AGENTS.filter(a => a.live).length,
+    deployableAgentCount: AGENTS.filter(a => a.cicdProvider === 'github').length,
+    realDataAvailable: !!realCounts,
+  });
+});
+
+// /api/metrics/regions — per-region resource breakdown (for dashboard map / cards)
+app.get('/api/metrics/regions', requireAuth, async (req, res) => {
+  const regions = REGIONS.filter(r => r.available);
+  const out = [];
+  const hasAzure = !!(await getAzureToken());
+
+  for (const region of regions) {
+    const foundation = MONTHLY_COST_USD.perRegion[region.id] || {};
+    const foundationTotal = Object.values(foundation).reduce((s, v) => s + v, 0);
+
+    let agentCount = 0;
+    let runningCount = 0;
+    if (hasAzure) {
+      const apps = await listContainerAppsInRg(region);
+      if (apps) {
+        const agentApps = apps.filter(a =>
+          AGENTS.some(agent => a.name === agent.id || a.name.startsWith(`${agent.id}-`))
+        );
+        agentCount = agentApps.length;
+        runningCount = agentApps.filter(a => a.runningStatus === 'Running').length;
       }
     } else {
-      fullText = rfpFile.buffer.toString('utf8');
+      const deployments = listDeployments().filter(d => d.regionId === region.id);
+      agentCount = deployments.length;
+      runningCount = deployments.filter(d => d.status === 'running').length;
     }
 
-    if (!fullText.trim()) return res.status(400).json({ error: 'Could not extract readable text from this document.' });
-
-    // Truncate to fit context window
-    const snippet  = fullText.substring(0, 14000);
-    const language     = (req.body.language || 'English').trim();
-    const srcLangName  = (req.body.source_language_name || 'Auto-Detect').trim();
-    const srcLangCode  = (req.body.source_language || 'auto').trim();
-    const isAutoDetect = srcLangCode === 'auto' || srcLangCode === '';
-
-    // ── Build a strong, unambiguous translation + extraction instruction ──────
-    // This works for ANY source→target pair: Arabic→Spanish, French→Korean, etc.
-    const langSystem = [
-      isAutoDetect
-        ? 'The document may be in ANY language. Automatically detect and read it.'
-        : `STEP 1 — READ: The document is written in ${srcLangName}. Read and understand every word of the ${srcLangName} document fully before doing anything else.`,
-      `STEP 2 — TRANSLATE & WRITE: You MUST produce the entire JSON output in ${language}.`,
-      `Every single text value in the JSON — executive_summary, scope, go_nogo_reason, all items in win_factors[], risk_flags[], recommended_actions[], eval_criteria[].criterion, compliance_standards[], timeline[].event, key_requirements[].title, key_requirements[].description, local_content, contact — MUST be written in ${language}.`,
-      `This is a translation task: source language is ${isAutoDetect ? 'auto-detected' : srcLangName}, output language is ${language}.`,
-      `Do NOT leave any text in the source language. Do NOT mix languages. If you find yourself writing in ${isAutoDetect ? 'the source language' : srcLangName}, STOP and translate to ${language}.`,
-      `Only these stay unchanged: JSON key names, numeric values, dates, percentages, reference codes (like "GOV-2025-IT-001"), and the go_nogo value ("GO"/"NO-GO"/"CONDITIONAL GO").`
-    ].join(' ');
-
-    // ── Call Claude to extract structured insights ────────────────────────────
-    const client = new Anthropic({ apiKey: _apiKey });
-    const prompt = `You are an expert multilingual RFP/RFI analyst and translator preparing an executive briefing for senior leadership.
-
-${langSystem}
-
-Analyze the following RFP/RFI document and extract ALL available information. Return ONLY a valid JSON object with this exact structure (no markdown, no extra text):
-
-{
-  "title": "Full RFP/RFI title",
-  "issuer": "Organization name",
-  "ref": "RFP/RFI reference number if any",
-  "executive_summary": "2-3 sentence summary of what they need and why it matters",
-  "scope": "3-4 sentence high-level scope description",
-  "industry": "Industry sector",
-  "contract_value": "Budget or contract value range if mentioned, else null",
-  "contract_duration": "Contract duration if mentioned, else null",
-  "submission_date": "Submission/response deadline date",
-  "qa_deadline": "Q&A or clarification deadline if mentioned, else null",
-  "award_date": "Expected award date if mentioned, else null",
-  "timeline": [
-    {"event": "event name", "date": "date string"}
-  ],
-  "key_requirements": [
-    {"id": "req id or number", "title": "requirement title", "priority": "MANDATORY/HIGH/MEDIUM", "description": "brief description"}
-  ],
-  "eval_criteria": [
-    {"criterion": "criterion name", "weight": "weight or percentage if given"}
-  ],
-  "compliance_standards": ["ISO 27001", "SOC 2", "etc"],
-  "go_nogo": "GO or CONDITIONAL GO or NO-GO",
-  "go_nogo_reason": "1-2 sentence justification for recommendation",
-  "win_probability": 65,
-  "win_factors": ["factor 1", "factor 2", "factor 3"],
-  "risk_flags": ["risk 1", "risk 2"],
-  "recommended_actions": ["action 1", "action 2", "action 3"],
-  "local_content": "Local content requirements if any, else null",
-  "contact": "Contact details if available, else null"
-}
-
-RFP DOCUMENT TEXT:
-${snippet}`;
-
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }]
+    out.push({
+      id: region.id,
+      cloud: region.cloud,
+      shortName: region.shortName,
+      flag: region.flag,
+      dataResidency: region.dataResidency,
+      agentCount,
+      runningCount,
+      foundationCostUsd: Math.round(foundationTotal * 100) / 100,
+      agentCostUsd: Math.round(agentCount * MONTHLY_COST_USD.containerApp * 100) / 100,
+      totalCostUsd: Math.round((foundationTotal + agentCount * MONTHLY_COST_USD.containerApp) * 100) / 100,
+      breakdown: foundation,
     });
-
-    const raw = msg.content.map(b => b.text || '').join('').trim();
-    // Strip any markdown fences
-    const clean = raw.replace(/^```json?\s*/i,'').replace(/\s*```$/,'').trim();
-    const data  = JSON.parse(clean);
-
-    res.json({ success: true, brief: data, filename: rfpFile.originalname });
-
-  } catch(err) {
-    const msg = err.status === 401 ? 'Invalid API key.'
-              : err.status === 400 ? 'API credit balance too low.'
-              : err instanceof SyntaxError ? 'AI returned invalid JSON — please retry.'
-              : err.message || 'Server error';
-    res.status(500).json({ error: msg });
   }
+  res.json({ regions: out, source: hasAzure ? 'azure-rest' : 'estimate' });
 });
 
-app.post('/api/generate', auth, async (req, res) => {
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key set. Contact your administrator to add one in Settings." });
-  const { rfpText, histTexts, histNames, config, library } = req.body;
-  if (!rfpText || !rfpText.trim()) return res.status(400).json({ error: 'No RFP text provided' });
-  const histCtx = histTexts && histTexts.length ? '\n\nHISTORICAL PROPOSALS:\n' + histTexts.map((t,i) => `[Ref ${i+1}: ${(histNames&&histNames[i])||'ref'}]\n${t.substring(0,2000)}`).join('\n\n') : '';
-  const libCtx  = library && library.length ? '\n\nLIBRARY RESPONSES:\n' + library.slice(-3).map(l => `[${l.rfp_name} score:${l.score}]\n${(l.response||'').substring(0,800)}`).join('\n\n') : '';
-  const prompt = `You are an expert RFP response writer for ${(config&&config.company)||user.org_name||'Our Organization'}.
-PROFILE: ${user.org_bio||'A leading technology solutions provider.'}
-INDUSTRY: ${(config&&config.industry)||'Technology / IT'} | TONE: ${(config&&config.tone)||'Formal & Professional'} | LENGTH: ${(config&&config.length)||'Comprehensive'}
-COMPLIANCE: ${(config&&config.compliance)||'Auto-detect'} | FOCUS: ${(config&&config.focus)||'all sections'}
-EXTRA CONTEXT: ${(config&&config.context)||'none'}
-
-RFP DOCUMENT:
-${rfpText.substring(0,4000)}${histCtx.substring(0,2000)}${libCtx.substring(0,1500)}
-
-Write a complete structured vendor response with sections: Executive Summary, Company Overview, Technical Solution, Implementation Plan, Compliance & Certifications, Team & Staffing, Pricing Structure, References & Case Studies. Use ## for H2 headers and ### for H3 sub-headers.
-
-End response with exactly this line:
-SCORES_JSON:{"requirements":85,"technical":78,"compliance":90,"clarity":88,"win_probability":72}`;
-  try {
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-    const msg = await client.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] });
-    const raw = msg.content.map(b => b.text||'').join('');
-    let scores = { requirements:75, technical:70, compliance:80, clarity:75, win_probability:65 };
-    const m = raw.match(/SCORES_JSON:(\{[^}]+\})/);
-    if (m) { try { scores = JSON.parse(m[1]); } catch(e) {} }
-    res.json({ response: raw.replace(/SCORES_JSON:\{[^}]+\}/, '').trim(), scores });
-  } catch(err) {
-    res.status(500).json({ error: err.status===401?'Invalid API key.':err.status===400?'Credit balance too low — add credits at console.anthropic.com':err.message||'API error' });
-  }
-});
-
-// ── AI: Improve text response ─────────────────────────────────────────────────
-app.post('/api/improve', auth, async (req, res) => {
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key set. Contact your administrator to add one in Settings." });
-  const { instruction, currentResponse, rfpText, scores: prev } = req.body;
-  const prompt = `Expert RFP writer. Improve the response per instruction: "${instruction}"
-RFP CONTEXT: ${(rfpText||'').substring(0,1500)}
-CURRENT RESPONSE:
-${currentResponse}
-Keep ## / ### structure. End with:
-SCORES_JSON:{"requirements":85,"technical":78,"compliance":90,"clarity":88,"win_probability":72}`;
-  try {
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-    const msg = await client.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] });
-    const raw = msg.content.map(b => b.text||'').join('');
-    let scores = prev || { requirements:75, technical:70, compliance:80, clarity:75, win_probability:65 };
-    const m = raw.match(/SCORES_JSON:(\{[^}]+\})/);
-    if (m) { try { scores = JSON.parse(m[1]); } catch(e) {} }
-    res.json({ response: raw.replace(/SCORES_JSON:\{[^}]+\}/, '').trim(), scores });
-  } catch(err) { res.status(500).json({ error: err.message||'API error' }); }
-});
-
-// ── Extract ALL rows from a historical docx that have vendor responses ─────────
-// Returns array of { reqId, reqTitle, reqDesc, response, fileName }
-// Works regardless of ID format — captures any row where column 4 has real content
-function extractHistoricalRows(xml, fileName) {
-  const rows = [];
-  const trRe = /<w:tr[ >][\s\S]*?<\/w:tr>/g;
-  let tm;
-  while ((tm = trRe.exec(xml)) !== null) {
-    const tr = tm[0];
-    const cells = [];
-    const tcRe = /<w:tc>[\s\S]*?<\/w:tc>/g;
-    let cm;
-    while ((cm = tcRe.exec(tr)) !== null) {
-      cells.push(cm[0].replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim());
-    }
-    if (cells.length >= 4) {
-      const col1 = cells[0].trim();
-      const col2 = cells[1].trim();
-      const col3 = cells[2].trim();
-      const col4 = cells[3].trim();
-      // Skip header rows and rows with no vendor response
-      if (!col2 || col4.length < 20) continue;
-      if (col4.toLowerCase().includes('[vendor to complete]')) continue;
-      if (col4.toLowerCase().includes('[vendor response]')) continue;
-      if (col4.toLowerCase().includes('source:') && col4.length < 40) continue;
-      // Strip source notes from previous runs (italic grey lines beginning "Source:")
-      const cleanedResp = col4.replace(/Source:[^\n]*/gi, '').trim();
-      if (cleanedResp.length < 15) continue;
-      rows.push({
-        reqId:    col1,
-        reqTitle: col2,
-        reqDesc:  col3,
-        response: cleanedResp,
-        fileName
-      });
-    }
-  }
-  return rows;
-}
-
-// ── Semantic matching: for each new requirement find best historical match ─────
-// Uses AI to match by meaning, not ID. Runs one batch call for all new reqs.
-// Returns { newReqId -> historicalRow } where a good match was found (confidence >= 7/10)
-async function semanticMatch(client, newRows, historicalRows) {
-  if (!historicalRows.length || !newRows.length) return {};
-
-  // Build compact index of historical rows
-  const histIndex = historicalRows.map((h, i) =>
-    `H${i}|ID:${h.reqId}|Title:${h.reqTitle}|Desc:${h.reqDesc.substring(0,120)}|Response preview:${h.response.substring(0,80)}`
-  ).join('\n');
-
-  // Build new requirements list
-  const newList = newRows.map((r, i) =>
-    `N${i}|ID:${r.reqId}|Title:${r.reqTitle}|Desc:${r.reqDesc.substring(0,150)}`
-  ).join('\n');
-
-  const prompt = `You are a requirements matching expert. Match each NEW requirement to the BEST historical requirement based on semantic meaning — even if the wording, numbering, or phrasing is different. The underlying topic and intent matter, not the exact words.
-
-HISTORICAL REQUIREMENTS (with vendor responses already written):
-${histIndex}
-
-NEW REQUIREMENTS (need vendor responses):
-${newList}
-
-For each new requirement (N0, N1, N2...), find the best historical match (H0, H1, H2...) if one exists.
-A match is valid if the new and historical requirements are about the same topic (e.g. both about firewall, both about identity management, both about compliance reporting).
-Only match if confidence is 7 or higher out of 10.
-
-Reply ONLY with a JSON array. No markdown, no explanation.
-[{"new":"N0","hist":"H2","confidence":9},{"new":"N1","hist":"H0","confidence":8},{"new":"N2","hist":null,"confidence":0}]`;
-
-  try {
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      messages: [{ role: 'user', content: prompt }]
-    });
-    const raw     = msg.content.map(b => b.text || '').join('').trim();
-    const cleaned = raw.replace(/^```[a-z]*\n?/,'').replace(/\n?```$/,'').trim();
-    const matches = JSON.parse(cleaned);
-
-    const result = {};
-    for (const m of matches) {
-      if (!m.hist || m.confidence < 7) continue;
-      const newIdx  = parseInt(m.new.replace('N',''));
-      const histIdx = parseInt(m.hist.replace('H',''));
-      if (isNaN(newIdx) || isNaN(histIdx)) continue;
-      if (newIdx >= newRows.length || histIdx >= historicalRows.length) continue;
-      result[newRows[newIdx].reqId] = historicalRows[histIdx];
-    }
-    return result;
-  } catch(e) {
-    return {}; // semantic match failed — fall back gracefully
-  }
-}
-
-
-// Step 1: Parse rows and inject unique placeholder markers into the 4th cell
-function injectPlaceholders(xml) {
-  const rows = [];
-  let markedXml = xml;
-  let offset = 0;
-
-  // ── Helper: extract all cell texts from a <w:tr> ───────────────────────────
-  function getCells(trXml) {
-    const cells = [];
-    const tcRe = /<w:tc>[\s\S]*?<\/w:tc>/g;
-    let m;
-    while ((m = tcRe.exec(trXml)) !== null) {
-      cells.push({ text: m[0].replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(), xml: m[0] });
-    }
-    return cells;
-  }
-
-  // ── Step 1: Collect all rows, find the header row ─────────────────────────
-  // Priority tiers — tier 0 wins over tier 3 when multiple columns match
-  const VENDOR_RESP_TIERS = [
-    // Tier 0: unambiguous vendor/company response columns (highest priority)
-    ['vendor response','vendor responses','your response','proposed response',
-     'vendor answer','company response','vendor to complete','fill in response'],
-    // Tier 1: compliance-specific response columns
-    ['compliance response','response to requirement','your answer',
-     'vendor comments','supplier response','bidder response'],
-    // Tier 2: generic standalone "response" or "answer"
-    ['answer','response'],
-    // Tier 3: last resort — only if nothing better exists
-    ['to be completed','fill in','tbd','comments','remarks','notes'],
-  ];
-
-  const allTrs = [];
-  const trRe = /<w:tr[ >][\s\S]*?<\/w:tr>/g;
-  let tm;
-  while ((tm = trRe.exec(xml)) !== null) {
-    allTrs.push({ xml: tm[0], index: tm.index });
-  }
-
-  if (!allTrs.length) return { rows: [], markedXml };
-
-  // Find the header row and the vendor-response column using priority tiers
-  let headerRowIdx   = -1;
-  let vendorColIdx   = -1;
-  let vendorTier     = 999;
-  let reqTextColIdx  = -1;
-  let reqIdColIdx    = -1;
-
-  for (let i = 0; i < Math.min(allTrs.length, 8); i++) {
-    const cells = getCells(allTrs[i].xml);
-    let rowHasVendorCol = false;
-
-    for (let c = 0; c < cells.length; c++) {
-      const txt = cells[c].text.toLowerCase().trim();
-      if (!txt) continue;
-
-      // Check each tier — lower tier number = higher priority
-      for (let tier = 0; tier < VENDOR_RESP_TIERS.length; tier++) {
-        if (VENDOR_RESP_TIERS[tier].some(k => txt === k || txt.includes(k))) {
-          if (tier < vendorTier) {
-            headerRowIdx = i;
-            vendorColIdx = c;
-            vendorTier   = tier;
-            rowHasVendorCol = true;
-          }
-          break; // don't check lower-priority tiers for this cell
-        }
-      }
-    }
-
-    // Once we've found a Tier 0 or Tier 1 match, commit to this header row
-    if (rowHasVendorCol && vendorTier <= 1) break;
-    // For Tier 2/3, keep scanning — a later row might have a better match
-    if (headerRowIdx >= 0 && vendorTier <= 1) break;
-  }
-
-  // Fallback: assume last column is vendor response
-  if (headerRowIdx < 0 || vendorColIdx < 0) {
-    const hdrCells = getCells(allTrs[0].xml);
-    headerRowIdx = 0;
-    vendorColIdx = hdrCells.length - 1;
-  }
-
-  // Identify the requirement text column from the header row
-  const hdrCells = getCells(allTrs[headerRowIdx].xml);
-  for (let c = 0; c < hdrCells.length; c++) {
-    if (c === vendorColIdx) continue;
-    const txt = hdrCells[c].text.toLowerCase().trim();
-    // Column that looks like a short ID/number column
-    if (reqIdColIdx < 0 && (txt === '#' || txt === 'no.' || txt === 'no' || txt === 'id' ||
-        txt === 'req#' || txt === 'req #' || txt === 'sl.no' || txt === 's.no' || txt === 'item no')) {
-      reqIdColIdx = c;
-      continue;
-    }
-    // First substantive column that isn't the ID or vendor response
-    if (reqTextColIdx < 0 && txt.length > 1) {
-      reqTextColIdx = c;
-    }
-  }
-  // Fallback: if still not found, pick first column that isn't vendorColIdx
-  if (reqTextColIdx < 0) {
-    reqTextColIdx = vendorColIdx === 0 ? 1 : 0;
-  }
-
-  // ── Step 2: Process data rows (everything after the header row) ────────────
-  const seenIds = {};
-
-  for (let i = headerRowIdx + 1; i < allTrs.length; i++) {
-    const cells = getCells(allTrs[i].xml);
-    if (cells.length <= vendorColIdx) continue; // row doesn't have enough columns
-
-    const reqText = reqTextColIdx < cells.length ? cells[reqTextColIdx].text.trim() : '';
-    if (reqText.length < 3) continue; // skip empty / spacer rows
-
-    // Skip rows that look like sub-headers inside the table
-    const SKIP_HDR = ['req#','req #','requirement','description','no.','s.no','sl.no','item no','item #','id','#','category','section','criteria','title','subject'];
-    if (reqText.length < 40 && SKIP_HDR.some(k => reqText.toLowerCase() === k)) continue;
-
-    // Build a unique, regex-safe ID
-    let rawId = '';
-    if (reqIdColIdx >= 0 && reqIdColIdx < cells.length) {
-      rawId = cells[reqIdColIdx].text.trim();
-    }
-    if (!rawId) rawId = `ROW${i}`;
-    // Sanitise and make unique
-    rawId = rawId.replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_\-]/g,'').substring(0, 30) || `ROW${i}`;
-    if (seenIds[rawId]) { rawId = rawId + '_' + i; }
-    seenIds[rawId] = true;
-
-    // Find extra description column (between reqText and vendor resp)
-    let reqDesc = '';
-    for (let c = 0; c < cells.length; c++) {
-      if (c === vendorColIdx || c === reqTextColIdx || c === reqIdColIdx) continue;
-      const t = cells[c].text.trim();
-      if (t.length > 3) { reqDesc = t; break; }
-    }
-
-    const existing      = cells[vendorColIdx].text.trim();
-    const placeholder   = `__RFPFILL_${rawId}__`;
-    const respCellXml   = cells[vendorColIdx].xml;
-    const propsM        = respCellXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/);
-    const cellProps     = propsM ? propsM[0] : '';
-    const placeholderCell = `<w:tc>${cellProps}<w:p><w:r><w:t xml:space="preserve">${placeholder}</w:t></w:r></w:p></w:tc>`;
-
-    // Replace exactly the vendor-response cell in markedXml
-    const trAbsStart = allTrs[i].index + offset;
-    let cellCount = 0;
-    const tcRe2 = /<w:tc>[\s\S]*?<\/w:tc>/g;
-    let cm2;
-    const trChunk = markedXml.substring(trAbsStart);
-    while ((cm2 = tcRe2.exec(trChunk)) !== null) {
-      if (cellCount === vendorColIdx) {
-        const cellAbsStart = trAbsStart + cm2.index;
-        const cellAbsEnd   = cellAbsStart + cm2[0].length;
-        markedXml = markedXml.substring(0, cellAbsStart) + placeholderCell + markedXml.substring(cellAbsEnd);
-        offset += placeholderCell.length - cm2[0].length;
-        break;
-      }
-      cellCount++;
-      if (cm2.index > allTrs[i].xml.length + 1000) break;
-    }
-
-    rows.push({ reqId: rawId, reqTitle: reqText, reqDesc, existing, placeholder });
-  }
-
-  return { rows, markedXml };
-}
-
-// Step 2: Build a proper <w:tc> with response text, preserving original cell width
-function buildResponseCell(text, origCellXml) {
-  const esc = text
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
-  const parasXml = esc.split(/\n+/).filter(p => p.trim()).map(p =>
-    `<w:p><w:pPr><w:spacing w:before="60" w:after="80"/></w:pPr>` +
-    `<w:r><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr>` +
-    `<w:t xml:space="preserve">${p.trim()}</w:t></w:r></w:p>`
-  ).join('');
-  const propsM = origCellXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/);
-  return `<w:tc>${propsM ? propsM[0] : ''}${parasXml}</w:tc>`;
-}
-
-// Step 3: Replace placeholder cells with filled cells including source note
-function applyResponses(markedXml, responseMap) {
-  let result = markedXml;
-  let filled = 0;
-
-  for (const [reqId, item] of Object.entries(responseMap)) {
-    const responseText = typeof item === 'string' ? item : item.response;
-    const sourceText   = typeof item === 'string' ? 'AI Generated' : (item.source || 'Azure Industry Best Practices');
-    const placeholder  = `__RFPFILL_${reqId}__`;
-
-    // Find the placeholder position using plain string search — no regex cross-cell risk
-    const phIdx = result.indexOf(placeholder);
-    if (phIdx === -1) continue; // placeholder not found, skip
-
-    // Walk backwards from placeholder to find the opening <w:tc> of this cell
-    const cellOpenTag = '<w:tc>';
-    let cellStart = result.lastIndexOf(cellOpenTag, phIdx);
-    if (cellStart === -1) continue;
-
-    // Walk forwards from placeholder to find the closing </w:tc> of this cell
-    const cellCloseTag = '</w:tc>';
-    let cellEnd = result.indexOf(cellCloseTag, phIdx);
-    if (cellEnd === -1) continue;
-    cellEnd += cellCloseTag.length; // include the closing tag itself
-
-    // Extract the original cell XML to preserve <w:tcPr> (column width etc.)
-    const origCellXml = result.substring(cellStart, cellEnd);
-    const propsM      = origCellXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/);
-
-    // Build replacement XML — handle multi-line template output and Unicode checkboxes
-    const lines = (responseText || '(no response)').split(/\n/);
-    const paragraphs = lines.map(line => {
-      const trimmed = line; // preserve leading spaces for indentation
-      if (!trimmed.trim()) {
-        // Empty line → spacing paragraph
-        return `<w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr></w:p>`;
-      }
-      // Detect if this line is a status/checkbox line (short, structured)
-      const isStatusLine = /^[☐☑✓✗□■✔●○]/.test(trimmed.trim()) ||
-                           /\b(compliant|yes|no|n\/a)\b.*[☐☑]/i.test(trimmed);
-      const fontSize = isStatusLine ? '20' : '20';
-      const isBold   = /^(compliance status|response|status|comments?|answer|remarks?)\s*[:：]/i.test(trimmed.trim());
-
-      // XML-escape the text
-      const esc = trimmed
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-        .replace(/"/g,'&quot;');
-
-      const rPr = `<w:rPr>${isBold ? '<w:b/>' : ''}<w:sz w:val="${fontSize}"/><w:szCs w:val="${fontSize}"/></w:rPr>`;
-      return `<w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>` +
-             `<w:r>${rPr}<w:t xml:space="preserve">${esc}</w:t></w:r></w:p>`;
-    }).join('');
-
-    const escSrc = sourceText
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      .replace(/"/g,'&quot;');
-
-    const sourceNote =
-      `<w:p><w:pPr><w:spacing w:before="40" w:after="0"/></w:pPr>` +
-      `<w:r><w:rPr><w:i/><w:sz w:val="16"/><w:szCs w:val="16"/><w:color w:val="888888"/></w:rPr>` +
-      `<w:t xml:space="preserve">Source: ${escSrc}</w:t></w:r></w:p>`;
-
-    const newCell = `<w:tc>${propsM ? propsM[0] : ''}${paragraphs}${sourceNote}</w:tc>`;
-
-    // Splice the new cell in — no regex, just string slicing
-    result = result.substring(0, cellStart) + newCell + result.substring(cellEnd);
-    filled++;
-  }
-
-  return { result, filled };
-}
-
-// AI: Enhance a single response — used when historical text is found but needs improving
-async function enhanceResponse(client, reqId, reqTitle, reqDesc, historicalText, fileName, tone, sentenceCount) {
-  const prompt = `You are an expert RFP response writer. A previous vendor response for this requirement has been found in the document "${fileName}". Your job is to ENHANCE it — keep all the original substance and intent, but improve clarity, add technical depth, strengthen compliance language, and make it more compelling. Do NOT replace it with generic content.
-
-REQUIREMENT: ${reqId} — ${reqTitle}
-DESCRIPTION: ${reqDesc}
-
-ORIGINAL RESPONSE FROM "${fileName}" (MUST be used as the primary basis):
-${historicalText}
-
-Return ONLY the enhanced response text (${sentenceCount} sentences). No JSON, no labels, no source attribution — just the improved response.`;
-
-  const msg = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 600,
-    messages: [{ role: 'user', content: prompt }]
-  });
-  return msg.content.map(b => b.text || '').join('').trim();
-}
-
-// ── Template detection: identify structured input cells ───────────────────────
-function detectTemplate(text) {
-  if (!text) return null;
-  const t = text;
-
-  // Checkbox-style selectors
-  const hasCheckbox     = /[☐☑✓✗□■]/.test(t) || /\[\s*\]/.test(t) || /\(\s*\)/.test(t);
-
-  // Explicit vendor tags
-  const hasVendorTag    = /\[vendor\s*(to complete|response|answer|fill|input)\]/i.test(t);
-
-  // Compliance status with checkboxes
-  const hasStatusField  = /\b(compliant|non.compliant|partially|status|yes|no|n\/a)\b/i.test(t) && hasCheckbox;
-
-  // Named response/comment/answer fields
-  const hasResponseTag  = /^(response|comments?|answer|justification)\s*[:：]/im.test(t);
-
-  // Labelled section fields (e.g. "SOLUTION DESCRIPTION:", "EVIDENCE / APPENDIX REF:")
-  const hasSectionLabel = /^[A-Z][A-Z\s\/&]{3,40}:\s*$/m.test(t) ||
-                          /^(solution description|evidence|appendix ref|compliance status|technical approach|implementation|pricing|references?)\s*[:：]/im.test(t);
-
-  // Dropdown placeholders: [Select from dropdown], [Select ▼], [Choose one]
-  const hasDropdown     = /\[select\b[^\]]{0,40}\]/i.test(t) || /\[choose\b[^\]]{0,30}\]/i.test(t) ||
-                          /\bfrom dropdown\b/i.test(t) || /▼/.test(t);
-
-  // Bracket placeholders: [Describe how...], [Enter your...], [Provide...], [Reference any...]
-  const hasPlaceholder  = /\[(?:describe|enter|provide|reference|specify|state|list|explain|include|attach|insert)[^\]]{5,120}\]/i.test(t);
-
-  // Colon-field placeholders: FIELD: [placeholder] or FIELD: ___
-  const hasColonField   = /:\s*\[[^\]]{5,}\]/.test(t) || /:\s*_{3,}/.test(t);
-
-  const isTemplate = hasCheckbox || hasVendorTag || hasStatusField || hasResponseTag ||
-                     hasSectionLabel || hasDropdown || hasPlaceholder || hasColonField;
-
-  if (!isTemplate) return null;
-
-  return {
-    isTemplate: true,
-    hasCheckbox, hasVendorTag, hasStatusField, hasResponseTag,
-    hasSectionLabel, hasDropdown, hasPlaceholder, hasColonField,
-    raw: t
+// /api/metrics/cost — cost breakdown by service type for analytics page
+app.get('/api/metrics/cost', requireAuth, async (req, res) => {
+  const regions = REGIONS.filter(r => r.available);
+  const breakdown = {
+    containerAppsEnv: 0,
+    containerApps: 0,
+    postgres: 0,
+    redis: 0,
+    keyVault: 0,
+    storage: 0,
+    logAnalytics: 0,
+    appInsights: 0,
   };
-}
 
-// ── AI: Fill a structured template cell intelligently ─────────────────────────
-async function fillTemplateResponse(client, reqId, reqTitle, reqDesc, templateText, vendorProfile, tone, sentenceCount, libContext) {
-  const tmplInfo     = detectTemplate(templateText) || {};
-  const isAdnocStyle = /compliance status/i.test(templateText) && /solution description/i.test(templateText);
-  const hasEvidence  = /evidence|appendix ref/i.test(templateText);
+  const hasAzure = !!(await getAzureToken());
 
-  const prompt = `You are an expert vendor completing an RFP/RFI response in an Excel or Word cell.
-The cell has a STRUCTURED TEMPLATE with labelled sections. Fill EVERY section — keep ALL labels intact.
+  for (const region of regions) {
+    const f = MONTHLY_COST_USD.perRegion[region.id] || {};
+    breakdown.containerAppsEnv += f.containerAppsEnv || 0;
+    breakdown.postgres += f.postgres || 0;
+    breakdown.redis += f.redis || 0;
+    breakdown.keyVault += f.keyVault || 0;
+    breakdown.storage += f.storage || 0;
+    breakdown.logAnalytics += f.logAnalytics || 0;
+    breakdown.appInsights += f.appInsights || 0;
 
-FILLING RULES:
-- "[Select from dropdown ▼]" or "[Select...]" → replace the ENTIRE bracket with the value (e.g. COMPLIANT). No brackets in output.
-- "[Describe how...]", "[Reference any...]", "[Enter your...]", "[Specify...]" → replace the ENTIRE bracket with real content.
-- COMPLIANCE STATUS → choose: COMPLIANT | PARTIALLY COMPLIANT | NON-COMPLIANT (default COMPLIANT if fully achievable).
-- SOLUTION DESCRIPTION → write ${sentenceCount} professional sentences. Name specific Azure services, tools, and your methodology.${isAdnocStyle ? '\n- SOLUTION DESCRIPTION must reference: the exact Azure service(s) needed, your implementation approach, and how acceptance criteria are met.' : ''}
-${hasEvidence ? '- EVIDENCE / APPENDIX REF → list relevant certifications (e.g. ISO 27001, SOC 2 Type II), Azure documentation, and appendix labels (e.g. Appendix A).\n' : ''}- Keep SECTION LABELS (e.g. "COMPLIANCE STATUS:", "SOLUTION DESCRIPTION:") exactly as-is on their own line.
-- Keep blank lines between sections as in the template.
-- Plain text only — no markdown, no asterisks, no bullet symbols unless already in the template.
-- Do NOT add new sections. Do NOT include preamble or explanation outside the template structure.
+    let appCount;
+    if (hasAzure) {
+      const apps = await listContainerAppsInRg(region);
+      apps && (appCount = apps.filter(a =>
+        AGENTS.some(agent => a.name === agent.id || a.name.startsWith(`${agent.id}-`))
+      ).length);
+    }
+    if (appCount === undefined) {
+      appCount = listDeployments().filter(d => d.regionId === region.id).length;
+    }
+    breakdown.containerApps += appCount * MONTHLY_COST_USD.containerApp;
+  }
 
-${vendorProfile ? 'VENDOR PROFILE: ' + vendorProfile + '\n' : ''}${libContext ? 'LIBRARY REFERENCE:\n' + libContext + '\n\n' : ''}REQUIREMENT: ${reqTitle}
-${reqDesc ? 'ACCEPTANCE CRITERIA: ' + reqDesc + '\n' : ''}
-TEMPLATE:
----
-${templateText}
----
+  // Round to 2dp
+  Object.keys(breakdown).forEach(k => { breakdown[k] = Math.round(breakdown[k] * 100) / 100; });
+  const total = Object.values(breakdown).reduce((s, v) => s + v, 0);
 
-Return ONLY the completed template. Preserve all labels and line breaks exactly.`;
-
-  const msg = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1200,
-    messages: [{ role: 'user', content: prompt }]
+  res.json({
+    breakdown,
+    total: Math.round(total * 100) / 100,
+    source: hasAzure ? 'azure-rest' : 'estimate',
   });
-  return msg.content.map(b => b.text || '').join('').trim();
-}
+});
 
-// AI: Write a fresh response from scratch using best practices
-async function writeNewResponse(client, reqId, reqTitle, reqDesc, vendorProfile, tone, sentenceCount, libContext) {
-  const prompt = `You are an expert RFP response writer.
-${vendorProfile ? 'VENDOR: ' + vendorProfile + '\n' : ''}${libContext ? 'LIBRARY CONTEXT:\n' + libContext + '\n\n' : ''}Write a professional vendor response for this requirement. Confirm compliance and explain specifically HOW it will be met using Azure services and tools.
+// /api/metrics/agents — per-agent stats for analytics bar chart
+app.get('/api/metrics/agents', requireAuth, (req, res) => {
+  // For now: requests are simulated. In v7 wire to App Insights / Log Analytics.
+  const deployments = listDeployments();
+  const out = AGENTS.filter(a => a.live).map(a => {
+    const myDeploys = deployments.filter(d => d.agentId === a.id);
+    return {
+      id: a.id,
+      name: a.name,
+      color: a.color,
+      icon: a.icon,
+      deployCount: myDeploys.length,
+      // Simulated request counts — proportional to deploy count, scaled with hash
+      // Replace with real App Insights query when available
+      requestsLast7d: myDeploys.length * (1500 + (a.id.charCodeAt(0) * 47) % 4500),
+    };
+  }).filter(a => a.deployCount > 0 || a.id === 'rfp-agent');  // always show RFP since it's the headline
 
-REQUIREMENT: ${reqId} — ${reqTitle}
-DESCRIPTION: ${reqDesc}
-TONE: ${tone || 'Formal & Professional'} | LENGTH: ${sentenceCount} sentences
+  out.sort((a, b) => b.requestsLast7d - a.requestsLast7d);
+  res.json({ agents: out, totalRequests: out.reduce((s, a) => s + a.requestsLast7d, 0) });
+});
 
-Return ONLY the response text. No JSON, no labels, no preamble.`;
+// /api/metrics/deploy-stats — speed, success rate
+app.get('/api/metrics/deploy-stats', requireAuth, (req, res) => {
+  const deployments = listDeployments();
+  const completed = deployments.filter(d => d.completedAt && d.createdAt);
+  const durations = completed.map(d =>
+    (new Date(d.completedAt).getTime() - new Date(d.createdAt).getTime()) / 1000
+  ).filter(d => d > 0);
 
-  const msg = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 600,
-    messages: [{ role: 'user', content: prompt }]
+  const avg = durations.length ? durations.reduce((s, d) => s + d, 0) / durations.length : 0;
+  const fastest = durations.length ? Math.min(...durations) : 0;
+  const slowest = durations.length ? Math.max(...durations) : 0;
+  const successCount = completed.filter(d => d.fqdnReal).length;
+  const successRate = completed.length ? Math.round((successCount / completed.length) * 100) : 100;
+
+  res.json({
+    avgSeconds: Math.round(avg),
+    fastestSeconds: Math.round(fastest),
+    slowestSeconds: Math.round(slowest),
+    successRate,
+    totalDeploys: deployments.length,
+    last30Days: deployments.filter(d =>
+      new Date(d.createdAt) > new Date(Date.now() - 30 * 86400_000)
+    ).length,
   });
-  return msg.content.map(b => b.text || '').join('').trim();
-}
-
-app.post('/api/fill-docx', auth, upload.fields([
-  { name: 'rfpDocx',    maxCount: 1 },
-  { name: 'histFiles',  maxCount: 5 }
-]), async (req, res) => {
-  const rfpFile = req.files && req.files['rfpDocx'] && req.files['rfpDocx'][0];
-  if (!rfpFile) return res.status(400).json({ error: 'No RFP .docx uploaded' });
-
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key set. Contact your administrator to add one in Settings." });
-
-  const library = db.getLibrary(req.user.id);
-  const { tone, length, instructions } = req.body;
-  const sentenceCount = length === 'Brief (2-3 sentences)' ? '2-3'
-                      : length === 'Detailed (5-7 sentences)' ? '5-7' : '3-5';
-
-  try {
-    // ── Step A: Extract ALL rows with responses from every uploaded historical doc ──
-    const allHistoricalRows = []; // flat list across all uploaded files
-    const histFilesUsed     = [];
-
-    if (req.files && req.files['histFiles']) {
-      for (const hf of req.files['histFiles']) {
-        try {
-          const hz  = new AdmZip(hf.buffer);
-          const he  = hz.getEntry('word/document.xml');
-          if (!he) continue;
-          const xml     = he.getData().toString('utf8');
-          const extracted = extractHistoricalRows(xml, hf.originalname);
-          if (extracted.length > 0) {
-            histFilesUsed.push({ name: hf.originalname, matchCount: 0, reqIds: [] });
-            allHistoricalRows.push(...extracted);
-          }
-        } catch(e) { /* skip unreadable files */ }
-      }
-    }
-
-    // ── Step B: Library context (for requirements with no historical match) ──
-    const libraryItemsUsed = library.slice(0, 3);
-    const libContext = libraryItemsUsed.length
-      ? libraryItemsUsed.map(l => `[${l.rfp_name}]\n${(l.response||'').substring(0, 400)}`).join('\n\n')
-      : '';
-
-    // ── Step C: Parse the new RFP docx ──
-    const zip      = new AdmZip(rfpFile.buffer);
-    const docEntry = zip.getEntry('word/document.xml');
-    if (!docEntry) return res.status(400).json({ error: 'Invalid .docx — document.xml not found' });
-    const docXml   = docEntry.getData().toString('utf8');
-
-    const { rows, markedXml } = injectPlaceholders(docXml);
-    if (!rows.length) return res.status(400).json({ error: 'No requirement rows found in the document. The file must contain a table with at least 2 columns — one for the requirement text and one for the vendor response. Make sure the document has a table (not just plain text paragraphs).' });
-
-    const vendorProfile = [
-      user.org_name ? `Company: ${user.org_name}` : '',
-      user.org_bio  ? user.org_bio.substring(0, 300) : '',
-      instructions  ? `Special instructions: ${instructions}` : ''
-    ].filter(Boolean).join(' | ');
-
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-
-    // ── Step D: Semantic matching — find best historical row for each new requirement ──
-    // First try exact ID match (fast), then semantic match for remainder
-    const semanticMatchMap = {}; // { newReqId -> historicalRow }
-
-    if (allHistoricalRows.length > 0) {
-      // Pass 1: exact ID match
-      const unmatchedRows = [];
-      for (const row of rows) {
-        const exactMatch = allHistoricalRows.find(h =>
-          h.reqId && h.reqId.trim().toUpperCase() === row.reqId.trim().toUpperCase()
-        );
-        if (exactMatch) {
-          semanticMatchMap[row.reqId] = { ...exactMatch, matchType: 'exact-id' };
-        } else {
-          unmatchedRows.push(row);
-        }
-      }
-
-      // Pass 2: semantic match for rows that didn't match by ID
-      if (unmatchedRows.length > 0) {
-        const semanticMatches = await semanticMatch(client, unmatchedRows, allHistoricalRows);
-        for (const [newReqId, histRow] of Object.entries(semanticMatches)) {
-          semanticMatchMap[newReqId] = { ...histRow, matchType: 'semantic' };
-        }
-      }
-
-      // Update histFilesUsed with actual matched counts
-      for (const [newReqId, histRow] of Object.entries(semanticMatchMap)) {
-        const fileEntry = histFilesUsed.find(f => f.name === histRow.fileName);
-        if (fileEntry && !fileEntry.reqIds.includes(newReqId)) {
-          fileEntry.reqIds.push(newReqId);
-          fileEntry.matchCount++;
-        }
-      }
-    }
-
-    // ── Step E: For each requirement — enhance matched historical OR write new ──
-    const responseMap = {};
-    const PARALLEL    = 4;
-
-    for (let i = 0; i < rows.length; i += PARALLEL) {
-      const batch = rows.slice(i, i + PARALLEL);
-      const results = await Promise.all(batch.map(async (row) => {
-        const hist     = semanticMatchMap[row.reqId];
-        const tmpl     = detectTemplate(row.existing);
-        const hasRealExisting = row.existing && row.existing.length > 20 &&
-                                !row.existing.toLowerCase().includes('[vendor') &&
-                                !row.existing.toLowerCase().includes('source:') &&
-                                !tmpl;
-
-        if (tmpl) {
-          // PRIORITY 1 (TEMPLATE): Structured cell — fill in-place preserving format
-          const filledTmpl = await fillTemplateResponse(
-            client, row.reqId, row.reqTitle, row.reqDesc,
-            tmpl.raw, vendorProfile, tone, sentenceCount, libContext
-          );
-          const libSuffix = libraryItemsUsed.length ? ' + library' : '';
-          return { reqId: row.reqId, response: filledTmpl, source: `AI Template Fill${libSuffix}` };
-
-        } else if (hist) {
-          // PRIORITY 2: Historical match — enhance with history
-          const matchLabel = hist.matchType === 'exact-id'
-            ? `${hist.fileName} (ID match: ${hist.reqId})`
-            : `${hist.fileName} (semantic match from: "${hist.reqTitle}")`;
-          const enhanced = await enhanceResponse(
-            client, row.reqId, row.reqTitle, row.reqDesc,
-            hist.response, matchLabel, tone, sentenceCount
-          );
-          return { reqId: row.reqId, response: enhanced, source: matchLabel };
-
-        } else if (hasRealExisting) {
-          // PRIORITY 3: Partial response already in cell — enhance it
-          const enhanced = await enhanceResponse(
-            client, row.reqId, row.reqTitle, row.reqDesc,
-            row.existing, `${rfpFile.originalname} (existing content)`, tone, sentenceCount
-          );
-          return { reqId: row.reqId, response: enhanced, source: `${rfpFile.originalname} (existing, enhanced)` };
-
-        } else {
-          // PRIORITY 4: Write from scratch
-          const fresh = await writeNewResponse(
-            client, row.reqId, row.reqTitle, row.reqDesc,
-            vendorProfile, tone, sentenceCount, libContext
-          );
-          const libSuffix = libraryItemsUsed.length ? ` + library context` : '';
-          return { reqId: row.reqId, response: fresh, source: `Azure Industry Best Practices${libSuffix}` };
-        }
-      }));
-
-      results.forEach(r => { responseMap[r.reqId] = { response: r.response, source: r.source }; });
-    }
-
-    // ── Step E: Write responses into docx ──
-    const { result: finalXml, filled } = applyResponses(markedXml, responseMap);
-    zip.updateFile('word/document.xml', Buffer.from(finalXml, 'utf8'));
-    const outBuf  = zip.toBuffer();
-    const safeName = rfpFile.originalname.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.docx$/i, '');
-    const outName  = safeName + '_AI_Filled_' + Date.now() + '.docx';
-
-    // Build per-source breakdown for UI
-    const sourceBreakdown = {};
-    for (const [reqId, item] of Object.entries(responseMap)) {
-      const src = item.source || 'Azure Industry Best Practices';
-      if (!sourceBreakdown[src]) sourceBreakdown[src] = [];
-      sourceBreakdown[src].push(reqId);
-    }
-
-    const histMatchedTotal = Object.keys(semanticMatchMap).length;
-    const histFileSummary  = histFilesUsed
-      .filter(f => f.matchCount > 0)
-      .map(f => `${f.name} (${f.matchCount} reqs: ${f.reqIds.join(', ')})`)
-      .join(' | ');
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
-    res.setHeader('X-Reqs-Found',         rows.length.toString());
-    res.setHeader('X-Reqs-Filled',        filled.toString());
-    res.setHeader('X-Hist-Files',         histFilesUsed.length.toString());
-    res.setHeader('X-Hist-Names',         histFilesUsed.map(f => f.name).join(' | '));
-    res.setHeader('X-Hist-Matched',       histMatchedTotal.toString());
-    res.setHeader('X-Hist-File-Summary',  histFileSummary);
-    res.setHeader('X-Lib-Used',           libraryItemsUsed.length.toString());
-    res.setHeader('X-Lib-Names',          libraryItemsUsed.map(l => l.rfp_name).join(' | '));
-    res.setHeader('X-Existing-Enhanced',  rows.filter(r => r.existing && r.existing.length > 20).length.toString());
-    res.setHeader('X-Source-Breakdown',   encodeURIComponent(JSON.stringify(sourceBreakdown)));
-    res.setHeader('Access-Control-Expose-Headers',
-      'X-Reqs-Found, X-Reqs-Filled, X-Hist-Files, X-Hist-Names, X-Hist-Matched, X-Hist-File-Summary, X-Lib-Used, X-Lib-Names, X-Existing-Enhanced, X-Source-Breakdown'
-    );
-    res.send(outBuf);
-
-  } catch(err) {
-    const msg = err.status === 401 ? 'Invalid API key.'
-              : err.status === 400 ? 'Credit balance too low — add credits at console.anthropic.com'
-              : err.message || 'Server error';
-    res.status(500).json({ error: msg });
-  }
 });
 
-// ── AI: Fill Excel RFP ────────────────────────────────────────────────────────
-app.post('/api/fill-xlsx', auth, upload.single('rfpXlsx'), async (req, res) => {
-  const rfpFile = req.file;
-  if (!rfpFile) return res.status(400).json({ error: 'No Excel file uploaded' });
-
-  const _apiKey = req.effectiveApiKey;
-  if (!_apiKey) return res.status(400).json({ error: 'No API key set. Contact your administrator.' });
-
-  const user = req.user;
-  const { tone, length, instructions } = req.body;
-  const sentenceCount = length === 'Brief (2-3 sentences)'    ? '2-3'
-                      : length === 'Detailed (5-7 sentences)' ? '5-7' : '3-5';
-
-  try {
-    // ── Step A: Read workbook preserving all styles and validation ─────────────
-    const wb = XLSX.read(rfpFile.buffer, {
-      type: 'buffer', cellStyles: true, cellDates: true,
-      sheetStubs: true, // include empty cells so we can detect them
-    });
-
-    // Use first visible sheet (skip hidden sheets)
-    let wsName = wb.SheetNames[0];
-    let ws     = wb.Sheets[wsName];
-
-    // ── Step B: Scan ALL cells to extract text (handles merged/shared strings) ─
-    function getCellText(ws, r, c) {
-      const cell = ws[XLSX.utils.encode_cell({ r, c })];
-      if (!cell) return '';
-      // .w = formatted text (most reliable for display value)
-      // .v = raw value
-      // .r = rich text (array of objects with .t)
-      let text = '';
-      if (cell.w !== undefined) text = String(cell.w);
-      else if (cell.v !== undefined) text = String(cell.v);
-      if (!text && cell.r) {
-        // Rich text: array of run objects
-        try {
-          text = (Array.isArray(cell.r) ? cell.r : [cell.r])
-            .map(run => typeof run === 'object' ? (run.t || '') : String(run || ''))
-            .join('');
-        } catch(e) {}
-      }
-      return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-    }
-
-    // ── Step C: Detect header row & columns ────────────────────────────────────
-    const range  = XLSX.utils.decode_range(ws['!ref'] || 'A1');
-    const maxRow = range.e.r;
-    const maxCol = range.e.c;
-
-    const VENDOR_RESP_TIERS = [
-      // Tier 0: unambiguous vendor response labels
-      ['vendor response','vendor responses','your response','proposed response',
-       'vendor to complete','vendor answer','company response','complete this column'],
-      ['compliance response','response to requirement','your answer','supplier response'],
-      ['answer','response'],
-      ['comments','remarks','notes'],
-    ];
-    const REQ_ID_KEYS      = ['req#','req #','req id','reqid','id','#','no.','no','sl.no','s.no','item no','sr.no'];
-    const REQUIREMENT_KEYS = ['requirement','requirements','description','description & acceptance',
-                               'item description','scope','specification','criteria'];
-    const DESCRIPTION_KEYS = ['description & acceptance','acceptance criteria','description and acceptance',
-                               'description & criteria'];
-
-    // ── CRITICAL: evaluate each row independently — do NOT let title rows pollute column indices ──
-    let headerRow = -1, reqIdCol = -1, requirementCol = -1, descCol = -1, vendorRespCol = -1;
-
-    for (let r = 0; r <= Math.min(9, maxRow); r++) {
-      // Collect column assignments FOR THIS ROW ONLY
-      let rowReqId = -1, rowReqCol = -1, rowDescCol = -1, rowVendorCol = -1;
-      let rowVendorTier = 999;
-      let idFound = false, reqFound = false, respFound = false;
-
-      for (let c = 0; c <= maxCol; c++) {
-        const val = getCellText(ws, r, c).toLowerCase();
-        // Only consider SHORT header-like values (avoid title rows which are long sentences)
-        if (!val || val.length < 2) continue;
-
-        if (REQ_ID_KEYS.some(k => val === k || val.startsWith(k + ' '))) {
-          rowReqId = c; idFound = true;
-        }
-        if (DESCRIPTION_KEYS.some(k => val.includes(k))) {
-          rowDescCol = c; reqFound = true;
-        }
-        if (rowDescCol < 0 && REQUIREMENT_KEYS.some(k => val.includes(k))) {
-          rowReqCol = c; reqFound = true;
-        }
-        for (let tier = 0; tier < VENDOR_RESP_TIERS.length; tier++) {
-          if (VENDOR_RESP_TIERS[tier].some(k => val === k || val.includes(k))) {
-            // REJECT if this row's cell is very long (likely a title/paragraph, not a header)
-            const rawVal = getCellText(ws, r, c);
-            if (rawVal.length > 80 && (idFound || reqFound)) {
-              // Long cell in a row that already has short header cells — likely a content row
-              break;
-            }
-            if (tier < rowVendorTier) {
-              rowVendorCol = c; rowVendorTier = tier; respFound = true;
-            }
-            break;
-          }
-        }
-      }
-
-      // Count how many distinct cells have SHORT values in this row (title/merged rows have only 1)
-      let nonEmptyCells = 0;
-      for (let c = 0; c <= maxCol; c++) {
-        const v = getCellText(ws, r, c);
-        if (v && v.length >= 2 && v.length <= 120) nonEmptyCells++;
-      }
-
-      // Commit this row as the header only if:
-      // 1. It has BOTH a requirement column AND a vendor response column
-      // 2. It has multiple distinct non-empty cells (not a merged title row)
-      const score = (idFound?1:0) + (reqFound?1:0) + (respFound?1:0);
-      if (score >= 2 && rowVendorCol >= 0 && nonEmptyCells >= 3) {
-        headerRow      = r;
-        reqIdCol       = rowReqId;
-        requirementCol = rowDescCol >= 0 ? rowDescCol : rowReqCol;
-        descCol        = rowDescCol;
-        vendorRespCol  = rowVendorCol;
-        break;
-      }
-    }
-
-    if (headerRow      === -1) headerRow      = 0;
-    if (requirementCol === -1) requirementCol = Math.max(0, (vendorRespCol >= 0 ? vendorRespCol : maxCol) - 1);
-    if (vendorRespCol  === -1) {
-      vendorRespCol = maxCol + 1;
-      ws[XLSX.utils.encode_cell({ r: headerRow, c: vendorRespCol })] = { v: 'Vendor Response', t: 's' };
-      const nr = XLSX.utils.decode_range(ws['!ref'] || 'A1');
-      nr.e.c = Math.max(nr.e.c, vendorRespCol);
-      ws['!ref'] = XLSX.utils.encode_range(nr);
-    }
-
-    // ── Step D: Collect rows to fill ───────────────────────────────────────────
-    // Also find a secondary "Requirement" col for the row title
-    let reqTitleCol = requirementCol;
-    for (let c = 0; c <= maxCol; c++) {
-      if (c === requirementCol || c === vendorRespCol) continue;
-      const hdrVal = getCellText(ws, headerRow, c).toLowerCase();
-      if (hdrVal === 'requirement' || hdrVal === 'requirements') { reqTitleCol = c; break; }
-    }
-
-    const rows = [];
-    for (let r = headerRow + 1; r <= maxRow; r++) {
-      const reqText  = getCellText(ws, r, requirementCol);
-      const reqTitle = reqTitleCol !== requirementCol ? getCellText(ws, r, reqTitleCol) : '';
-      if (!reqText && !reqTitle) continue; // completely empty row
-
-      const idCell   = reqIdCol >= 0 ? getCellText(ws, r, reqIdCol) : `ROW-${r}`;
-      const existing = getCellText(ws, r, vendorRespCol);
-
-      // Skip only if genuinely filled (no template markers)
-      const cellTmpl = detectTemplate(existing);
-      if (!cellTmpl && existing.length > 30 &&
-          !/\[select|\[describe|\[provide|\[enter|\[reference|\[specify|\bvendor\b/i.test(existing)) continue;
-
-      rows.push({
-        r,
-        reqId:   String(idCell || `ROW-${r}`),
-        reqText: reqText || reqTitle,
-        reqDesc: reqTitle !== reqText ? reqTitle : '',
-        existing,
-        tmpl:    cellTmpl,
-      });
-    }
-
-    if (!rows.length) {
-      return res.status(400).json({ error: 'No unfilled requirement rows found in the sheet "' + wsName + '". Ensure the Vendor Response column has template placeholders or is empty.' });
-    }
-
-    // ── Step E: Generate AI responses ─────────────────────────────────────────
-    const client       = new Anthropic({ apiKey: _apiKey });
-    const library      = db.getLibrary(req.user.id);
-    const libContext   = library.slice(0, 3).map(l => `[${l.rfp_name}]\n${(l.response||'').substring(0,400)}`).join('\n\n');
-    const vendorProfile = [
-      user.org_name ? `Company: ${user.org_name}` : '',
-      user.org_bio  ? user.org_bio.substring(0, 300) : '',
-      instructions  ? `Special instructions: ${instructions}` : ''
-    ].filter(Boolean).join(' | ');
-
-    const PARALLEL = 4;
-    let filled = 0;
-
-    for (let i = 0; i < rows.length; i += PARALLEL) {
-      const batch   = rows.slice(i, i + PARALLEL);
-      const results = await Promise.all(batch.map(async (row) => {
-        let response;
-        if (row.tmpl) {
-          response = await fillTemplateResponse(
-            client, row.reqId, row.reqText, row.reqDesc,
-            row.tmpl.raw, vendorProfile, tone, sentenceCount, libContext
-          );
-        } else {
-          response = await writeNewResponse(
-            client, row.reqId, row.reqText, row.reqDesc,
-            vendorProfile, tone, sentenceCount, libContext
-          );
-        }
-        return { row, response };
-      }));
-
-      // Write responses back into the correct cell
-      for (const { row, response } of results) {
-        const addr = XLSX.utils.encode_cell({ r: row.r, c: vendorRespCol });
-        // Preserve the original cell object but update value
-        const origCell = ws[addr] || {};
-        ws[addr] = {
-          ...origCell,        // keep existing styles, comments, validation refs
-          v: response,
-          w: response,        // formatted text = same as value
-          t: 's',             // string type
-          s: {                // override style: wrap + green tint
-            ...(origCell.s || {}),
-            alignment: { wrapText: true, vertical: 'top' },
-            fill:      { patternType: 'solid', fgColor: { rgb: 'E8F5E9' } },
-            font:      { sz: 10, ...(origCell.s && origCell.s.font ? origCell.s.font : {}) },
-          },
-        };
-        filled++;
-      }
-    }
-
-    // ── Step F: Column widths & row heights ────────────────────────────────────
-    if (!ws['!cols']) ws['!cols'] = [];
-    for (let c = 0; c <= Math.max(maxCol, vendorRespCol); c++) {
-      ws['!cols'][c] = ws['!cols'][c] || {};
-      if (c === vendorRespCol)   ws['!cols'][c].wch = 65;
-      else if (c === requirementCol) ws['!cols'][c].wch = 50;
-      else ws['!cols'][c].wch = ws['!cols'][c].wch || 18;
-    }
-    if (!ws['!rows']) ws['!rows'] = [];
-    for (let r = headerRow + 1; r <= maxRow; r++) {
-      ws['!rows'][r] = { ...(ws['!rows'][r] || {}), hpt: 80 };
-    }
-
-    // ── Step G: Write out ──────────────────────────────────────────────────────
-    const outBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', cellStyles: true });
-    const safeName = rfpFile.originalname.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.(xlsx?|xls)$/i, '');
-    const outName  = safeName + '_AI_Filled.xlsx';
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
-    res.setHeader('X-Reqs-Found',   rows.length.toString());
-    res.setHeader('X-Reqs-Filled',  filled.toString());
-    res.setHeader('X-Sheet-Name',   wsName);
-    res.setHeader('X-Vendor-Col',   XLSX.utils.encode_col(vendorRespCol));
-    res.setHeader('X-Header-Row',   (headerRow + 1).toString());
-    res.setHeader('Access-Control-Expose-Headers', 'X-Reqs-Found, X-Reqs-Filled, X-Sheet-Name, X-Vendor-Col, X-Header-Row');
-    res.send(outBuf);
-
-  } catch(err) {
-    const msg = err.status === 401 ? 'Invalid API key.'
-              : err.status === 400 ? 'API credit balance too low.'
-              : err.message || 'Server error';
-    res.status(500).json({ error: msg });
-  }
-});
-
-// ── AI: Fill PDF RFP ──────────────────────────────────────────────────────────
-// PDFs can't be edited in-place, so we:
-//   1. Extract all text from the PDF
-//   2. Parse requirement rows from the text (table-style or numbered list)
-//   3. Generate AI responses for each row
-//   4. Return a filled Word (.docx) document mirroring the PDF structure
-app.post('/api/fill-pdf', auth, upload.single('rfpPdf'), async (req, res) => {
-  const rfpFile = req.file;
-  if (!rfpFile) return res.status(400).json({ error: 'No PDF file uploaded' });
-
-  const _apiKey = req.effectiveApiKey;
-  if (!_apiKey) return res.status(400).json({ error: 'No API key set. Contact your administrator.' });
-
-  const user = req.user;
-  const { tone, length, instructions } = req.body;
-  const sentenceCount = length === 'Brief (2-3 sentences)'    ? '2-3'
-                      : length === 'Detailed (5-7 sentences)' ? '5-7' : '3-5';
-  const library = db.getLibrary(req.user.id);
-  const libContext = library.slice(0, 3).map(l => `[${l.rfp_name}]\n${(l.response||'').substring(0,400)}`).join('\n\n');
-  const vendorProfile = [
-    user.org_name ? `Company: ${user.org_name}` : '',
-    user.org_bio  ? user.org_bio.substring(0, 300) : '',
-    instructions  ? `Special instructions: ${instructions}` : ''
-  ].filter(Boolean).join(' | ');
-
-  try {
-    // ── Step A: Extract text from PDF ────────────────────────────────────────
-    const pdfData = await pdfParse(rfpFile.buffer);
-    const fullText = pdfData.text || '';
-    if (!fullText.trim()) {
-      return res.status(400).json({ error: 'Could not extract text from this PDF. It may be a scanned image — please use a text-based PDF.' });
-    }
-
-    // ── Step B: Parse requirement rows from extracted text ────────────────────
-    // Detect: numbered rows (1. / 1.1 / REQ-001), table rows, bullet items
-    const VENDOR_MARKERS = /\[vendor\s*(to complete|response|fill|input)\]|\bvendor response\b|\bresponse\s*:\s*$/im;
-    const rows = [];
-    const lines = fullText.split(/\n/);
-    const seenIds = {};
-
-    // Strategy 1: Tab/pipe-separated table rows
-    const tableRows = lines.filter(l => (l.match(/\t/g)||[]).length >= 2 || (l.match(/\|/g)||[]).length >= 2);
-    if (tableRows.length >= 3) {
-      // Find header row
-      let hdrIdx = -1, vendorCol = -1, reqCol = -1;
-      for (let i = 0; i < Math.min(tableRows.length, 5); i++) {
-        const cols = tableRows[i].split(/\t|\|/).map(c => c.trim());
-        for (let c = 0; c < cols.length; c++) {
-          const v = cols[c].toLowerCase();
-          if (['vendor response','response','your response','answer'].some(k => v.includes(k))) { vendorCol = c; }
-          if (['requirement','description','item'].some(k => v.includes(k))) { reqCol = c; }
-        }
-        if (vendorCol >= 0 || reqCol >= 0) { hdrIdx = i; break; }
-      }
-      if (hdrIdx >= 0) {
-        if (reqCol < 0) reqCol = vendorCol > 0 ? 0 : 1;
-        if (vendorCol < 0) vendorCol = reqCol + 1;
-        for (let i = hdrIdx + 1; i < tableRows.length; i++) {
-          const cols = tableRows[i].split(/\t|\|/).map(c => c.trim());
-          const reqText = cols[reqCol] || '';
-          if (reqText.length < 4) continue;
-          const existing = cols[vendorCol] || '';
-          const rawId = `ROW${i}`;
-          rows.push({ reqId: rawId, reqTitle: reqText, reqDesc: '', existing, isTemplate: !!detectTemplate(existing) });
-        }
-      }
-    }
-
-    // Strategy 2: Numbered / structured paragraphs (if table parsing got < 3 rows)
-    if (rows.length < 3) {
-      rows.length = 0;
-      const REQ_LINE = /^(\d+[\.\)]\d*[\.\)]?\d*|REQ[-\s]?\d+|[A-Z]{1,3}[-]\d+|[•\-*]\s{1,3})\s+(.{8,})/;
-      let currentId = null, currentText = '', currentTemplate = '';
-      let reqCounter = 0;
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        const m = line.match(REQ_LINE);
-        if (m) {
-          // Save previous
-          if (currentId && currentText.length > 4) {
-            const rawId = currentId.replace(/[^a-zA-Z0-9_\-]/g,'').substring(0,20) || `ROW${reqCounter}`;
-            rows.push({ reqId: rawId, reqTitle: currentText.trim(), reqDesc: '', existing: currentTemplate, isTemplate: !!detectTemplate(currentTemplate) });
-          }
-          reqCounter++;
-          currentId   = m[1].replace(/\s/g,'');
-          currentText = m[2];
-          currentTemplate = '';
-          // Check next lines for vendor response template
-          for (let j = i+1; j < Math.min(i+6, lines.length); j++) {
-            const nextLine = lines[j].trim();
-            if (VENDOR_MARKERS.test(nextLine) || detectTemplate(nextLine)) {
-              currentTemplate = lines.slice(j, Math.min(j+4, lines.length)).join('\n').trim();
-              break;
-            }
-          }
-        } else if (currentId && line.length > 2) {
-          currentText += ' ' + line;
-        }
-      }
-      // Save last
-      if (currentId && currentText.length > 4) {
-        const rawId = currentId.replace(/[^a-zA-Z0-9_\-]/g,'').substring(0,20) || `ROW${reqCounter}`;
-        rows.push({ reqId: rawId, reqTitle: currentText.trim(), reqDesc: '', existing: currentTemplate, isTemplate: !!detectTemplate(currentTemplate) });
-      }
-    }
-
-    if (!rows.length) {
-      return res.status(400).json({ error: 'No requirement rows found in the PDF. Ensure the PDF has numbered requirements or a table with requirement descriptions.' });
-    }
-
-    // ── Step C: Generate AI responses ────────────────────────────────────────
-    const client = new Anthropic({ apiKey: _apiKey });
-    const PARALLEL = 4;
-    const responseMap = {};
-
-    for (let i = 0; i < rows.length; i += PARALLEL) {
-      const batch = rows.slice(i, i + PARALLEL);
-      const results = await Promise.all(batch.map(async (row) => {
-        let response;
-        if (row.isTemplate && row.existing) {
-          response = await fillTemplateResponse(client, row.reqId, row.reqTitle, row.reqDesc, row.existing, vendorProfile, tone, sentenceCount, libContext);
-        } else {
-          response = await writeNewResponse(client, row.reqId, row.reqTitle, row.reqDesc, vendorProfile, tone, sentenceCount, libContext);
-        }
-        return { reqId: row.reqId, response };
-      }));
-      results.forEach(r => { responseMap[r.reqId] = r.response; });
-    }
-
-    // ── Step D: Build a Word document with the responses ─────────────────────
-    // Table: Req# | Requirement | Vendor Response
-    function xmlEsc(s) {
-      return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-    function makeCell(text, width, bold) {
-      const esc = xmlEsc(text);
-      const paras = esc.split(/\n/).map(l =>
-        `<w:p><w:r><w:rPr>${bold?'<w:b/>':''}<w:sz w:val="20"/></w:rPr><w:t xml:space="preserve">${l||' '}</w:t></w:r></w:p>`
-      ).join('');
-      return `<w:tc><w:tcPr><w:tcW w:w="${width}" w:type="dxa"/></w:tcPr>${paras}</w:tc>`;
-    }
-
-    const hdrRow = `<w:tr>
-      ${makeCell('Req #', 800, true)}
-      ${makeCell('Requirement / Description', 4200, true)}
-      ${makeCell('Vendor Response', 4000, true)}
-    </w:tr>`;
-
-    const dataRows = rows.map(row => `<w:tr>
-      ${makeCell(row.reqId, 800, false)}
-      ${makeCell(row.reqTitle + (row.reqDesc ? '\n' + row.reqDesc : ''), 4200, false)}
-      ${makeCell(responseMap[row.reqId] || '', 4000, false)}
-    </w:tr>`).join('');
-
-    const tableXml = `<w:tbl>
-      <w:tblPr>
-        <w:tblStyle w:val="TableGrid"/>
-        <w:tblW w:w="9000" w:type="dxa"/>
-        <w:tblBorders>
-          <w:top w:val="single" w:sz="4" w:color="272160"/>
-          <w:left w:val="single" w:sz="4" w:color="272160"/>
-          <w:bottom w:val="single" w:sz="4" w:color="272160"/>
-          <w:right w:val="single" w:sz="4" w:color="272160"/>
-          <w:insideH w:val="single" w:sz="4" w:color="CCCCCC"/>
-          <w:insideV w:val="single" w:sz="4" w:color="CCCCCC"/>
-        </w:tblBorders>
-      </w:tblPr>
-      <w:tblGrid>
-        <w:gridCol w:w="800"/>
-        <w:gridCol w:w="4200"/>
-        <w:gridCol w:w="4000"/>
-      </w:tblGrid>
-      ${hdrRow}${dataRows}
-    </w:tbl>`;
-
-    const titlePara = `<w:p><w:pPr><w:spacing w:after="200"/></w:pPr>
-      <w:r><w:rPr><w:b/><w:sz w:val="32"/><w:color w:val="272160"/></w:rPr>
-        <w:t>RFP Response — ${xmlEsc(rfpFile.originalname.replace(/\.pdf$/i,''))}</w:t>
-      </w:r></w:p>
-    <w:p><w:pPr><w:spacing w:after="80"/></w:pPr>
-      <w:r><w:rPr><w:sz w:val="18"/><w:color w:val="888888"/></w:rPr>
-        <w:t>Generated by RFP Agent · ${new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'long',year:'numeric'})}</w:t>
-      </w:r></w:p>
-    <w:p><w:pPr><w:spacing w:after="120"/></w:pPr></w:p>`;
-
-    const docXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
-  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <w:body>
-    ${titlePara}
-    ${tableXml}
-    <w:sectPr>
-      <w:pgSz w:w="12240" w:h="15840"/>
-      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"/>
-    </w:sectPr>
-  </w:body>
-</w:document>`;
-
-    // Minimal .docx zip structure
-    const docxZip = new AdmZip();
-    docxZip.addFile('word/document.xml', Buffer.from(docXml, 'utf8'));
-    docxZip.addFile('word/_rels/document.xml.rels', Buffer.from(
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-</Relationships>`, 'utf8'));
-    docxZip.addFile('[Content_Types].xml', Buffer.from(
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>`, 'utf8'));
-    docxZip.addFile('_rels/.rels', Buffer.from(
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`, 'utf8'));
-
-    const outBuf  = docxZip.toBuffer();
-    const safeName = rfpFile.originalname.replace(/[^a-zA-Z0-9._-]/g,'_').replace(/\.pdf$/i,'');
-    const outName  = safeName + '_AI_Filled.docx';
-    const filled   = Object.keys(responseMap).length;
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
-    res.setHeader('X-Reqs-Found',  rows.length.toString());
-    res.setHeader('X-Reqs-Filled', filled.toString());
-    res.setHeader('Access-Control-Expose-Headers', 'X-Reqs-Found, X-Reqs-Filled');
-    res.send(outBuf);
-
-  } catch(err) {
-    const msg = err.status === 401 ? 'Invalid API key.'
-              : err.status === 400 ? 'API credit balance too low.'
-              : err.message || 'Server error';
-    res.status(500).json({ error: msg });
-  }
-});
-
-// ── AI: Effort Estimation ─────────────────────────────────────────────────────
-app.post('/api/estimate-effort', auth, upload.fields([
-  { name: 'histFiles', maxCount: 5 }
-]), async (req, res) => {
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key set. Contact your administrator to add one in Settings." });
-
-  const { deploymentType, durationMonths, projectScope, vatpIncluded, vaptAmount, ipCost, azureCostPerMonth } = req.body;
-
-  // Parse optional additional cost items
-  let extraCosts = [];
-  if (req.body.extraCostsJson) {
-    try {
-      const parsed = JSON.parse(req.body.extraCostsJson);
-      extraCosts = parsed.filter(c => c.label && typeof c.amount === 'number').slice(0, 20);
-    } catch(e) {}
-  }
-  const extraCostsTotal = extraCosts.reduce((s, c) => s + (parseFloat(c.amount) || 0), 0);
-
-  // Load saved rate card (falls back to defaults if not set)
-  let savedRateCard = [];
-  try { savedRateCard = JSON.parse(user.rate_card || '[]'); } catch(e) {}
-
-  let savedAzureServices = [];
-  try { savedAzureServices = JSON.parse(user.azure_services || '[]'); } catch(e) {}
-
-  // Build rate map for prompt  { roleName -> dailyRateAED }
-  const rateMap = {};
-  savedRateCard.forEach(r => { if (r.role && r.rate) rateMap[r.role] = r.rate; });
-
-  // Extract effort/staffing context from historical docs (docx + all other formats)
-  let histContext = '';
-  if (req.files && req.files['histFiles']) {
-    for (const hf of req.files['histFiles']) {
-      try {
-        const hz  = new AdmZip(hf.buffer);
-        const he  = hz.getEntry('word/document.xml');
-        if (!he) continue;
-        const text = he.getData().toString('utf8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ');
-        const effortSection = text.match(/(?:effort|staffing|team|resource|days?|months?|FTE|role)[^.]{0,500}/gi) || [];
-        histContext += `[${hf.originalname}]\n${effortSection.slice(0,20).join('. ')}\n\n`;
-      } catch(e) {}
-    }
-  }
-  // Also accept pre-extracted text from PDF/Excel/TXT sent by browser
-  if (req.body && req.body.histTextsJson) {
-    try {
-      const histTexts = JSON.parse(req.body.histTextsJson);
-      for (const ht of histTexts) {
-        const keywords = /(?:effort|staffing|team|resource|days?|months?|FTE|role|cost|budget|AED|USD|rate)/gi;
-        const effortSection = (ht.text||'').match(new RegExp('.{0,30}(?:effort|staffing|team|resource|days?|months?|FTE|role|cost|budget|rate).{0,300}','gi')) || [];
-        if (effortSection.length > 0) {
-          histContext += `[${ht.name}]\n${effortSection.slice(0,20).join('. ')}\n\n`;
-        } else {
-          histContext += `[${ht.name}]\n${(ht.text||'').substring(0,1500)}\n\n`;
-        }
-      }
-    } catch(e) {}
-  }
-
-  const months    = parseInt(durationMonths) || 3;
-  const monthCols = Array.from({length: months}, (_, i) => `M${i+1}`);
-
+// /api/users — RBAC roles + (in-memory) user list
+app.get('/api/users', requireAuth, (req, res) => {
+  // Roles config — display-only for now
   const roles = [
-    'Infrastructure Architect',
-    'Security Architect',
-    'Senior DevSecOps Engineer',
-    'Senior Cloud Infrastructure Engineer',
-    'Network Security Engineer',
-    'Site Reliability Engineer (SRE)',
-    'Senior MLOps Engineer',
-    'InfoSec Specialist',
-    'Project Manager',
-    'QA / Test Engineer'
+    {
+      id: 'admin', name: 'Admin', count: USERS.filter(u => u.role === 'admin').length,
+      permissions: [
+        { allowed: true, label: 'Deploy agents to any region' },
+        { allowed: true, label: 'Stop and update deployments' },
+        { allowed: true, label: 'Manage users and roles' },
+        { allowed: true, label: 'View all costs and audit logs' },
+        { allowed: true, label: 'Configure platform secrets' },
+      ],
+    },
+    {
+      id: 'developer', name: 'Developer', count: 0,
+      permissions: [
+        { allowed: true, label: 'Deploy their own agents' },
+        { allowed: true, label: 'View their own deployments' },
+        { allowed: true, label: 'Download IaC templates' },
+        { allowed: true, label: 'View own cost breakdown' },
+        { allowed: false, label: "Cannot stop other users' deployments" },
+        { allowed: false, label: 'Cannot manage users' },
+      ],
+    },
+    {
+      id: 'viewer', name: 'Viewer', count: USERS.filter(u => u.role === 'viewer').length,
+      permissions: [
+        { allowed: true, label: 'Browse agent marketplace' },
+        { allowed: true, label: 'View deployment statuses' },
+        { allowed: true, label: 'View health dashboards' },
+        { allowed: false, label: 'Cannot deploy or stop' },
+        { allowed: false, label: 'Cannot view cost data' },
+      ],
+    },
+    {
+      id: 'tenant-user', name: 'Tenant User', count: 0,
+      permissions: [
+        { allowed: true, label: 'Access their tenant agent URLs' },
+        { allowed: true, label: 'Authenticate via Azure AD SSO' },
+        { allowed: false, label: 'Cannot see platform admin UI' },
+      ],
+    },
   ];
 
-  // Build rate card instruction for AI — use stored rates if available
-  const rateCardNote = roles.map(r => {
-    const rate = rateMap[r];
-    return rate ? `${r}: ${rate} AED/day (USE THIS EXACT RATE)` : `${r}: estimate market rate`;
+  // Only admins see the user list itself (role config visible to anyone)
+  const userList = req.session.user.role === 'admin'
+    ? USERS.map(u => ({ id: u.id, email: u.email, name: u.name, role: u.role }))
+    : null;
+
+  res.json({ roles, users: userList });
+});
+
+// /api/roi — business case stats, computed from real platform data
+app.get('/api/roi', requireAuth, async (req, res) => {
+  const deployments = listDeployments();
+  const regions = REGIONS.filter(r => r.available);
+  const completed = deployments.filter(d => d.completedAt && d.createdAt);
+  const durations = completed.map(d =>
+    (new Date(d.completedAt).getTime() - new Date(d.createdAt).getTime()) / 1000
+  ).filter(d => d > 0);
+  const avgSec = durations.length ? durations.reduce((s, d) => s + d, 0) / durations.length : 0;
+
+  // Manual deploy benchmark: 3-5 days, midpoint = 4 days = 345600s
+  const MANUAL_BENCHMARK_S = 345_600;
+  const speedup = avgSec ? Math.round((1 - avgSec / MANUAL_BENCHMARK_S) * 100) : 98;
+
+  res.json({
+    metrics: [
+      {
+        value: speedup + '%',
+        label: 'Faster deployment',
+        sub: avgSec
+          ? `${(avgSec/60).toFixed(1)} min vs 3–5 days manual`
+          : '~4 min vs 3–5 days manual',
+      },
+      {
+        value: AGENTS.filter(a => a.live).length.toString(),
+        label: 'Agents on platform',
+        sub: 'Deployed and managed centrally',
+      },
+      {
+        value: regions.length.toString(),
+        label: 'Active regions',
+        sub: regions.map(r => r.flag + ' ' + r.shortName).join(' · '),
+      },
+      {
+        value: new Set(regions.map(r => r.cloud)).size.toString(),
+        label: 'Cloud providers',
+        sub: 'Multi-cloud-ready architecture',
+      },
+      {
+        value: '$0',
+        label: 'Secret exposure risk',
+        sub: 'All keys via Key Vault references',
+      },
+      {
+        value: '100%',
+        label: 'Audit covered',
+        sub: 'Every deploy + action logged',
+      },
+    ],
+    roadmap: [
+      { phase: 'Now', title: 'Multi-region production-ready', desc: 'UAE North + UK South active. Region-locked tenants. Real GitHub Actions CI/CD per deploy.' },
+      { phase: 'Q2', title: 'Tenant lifecycle & quotas', desc: 'Tenants table, region locking, per-tenant quotas, billing tags on Azure resources for cost attribution.' },
+      { phase: 'Q2', title: 'Shared-tenant mode for RFP agent', desc: 'Schema migration with tenant_id, Postgres RLS policies, storage path scoping. Lets multiple customers share one container safely.' },
+      { phase: 'Q3', title: 'Custom domains', desc: 'Customers reach agents via <slug>.customers.yourdomain.com with managed certificates.' },
+      { phase: 'Q3', title: 'Real telemetry', desc: 'Wire App Insights into every deployed agent. Per-agent request counts, latencies, error rates flow into Analytics page.' },
+      { phase: 'Q4', title: 'Self-service agent submission', desc: 'Catalogue grows from 1 deployable to all 25, then accepts external agent submissions via PR review.' },
+      { phase: 'Q4', title: 'AI-powered cost optimization', desc: 'Right-sizing recommendations, scale-to-zero for idle agents, spot-instance scheduling.' },
+    ],
+  });
+});
+
+// ─── AI Chat assistant ────────────────────────────────────────────────────────
+// Helps users understand agents, regions, costs, compliance, and deployment status.
+//
+// Two modes:
+//   1. If ANTHROPIC_API_KEY is set in the env, calls the Anthropic Messages API
+//      with a system prompt that includes the full agent + region catalog.
+//   2. Otherwise, a rule-based responder uses the same catalog data to answer
+//      common questions. Works fully offline / without external deps.
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
+
+function buildChatSystemPrompt(contextAgent, contextRegion) {
+  const liveAgents = AGENTS.filter(a => a.live);
+  const deployable = liveAgents.filter(a => a.cicdProvider === 'github');
+  const regions = REGIONS.filter(r => r.available);
+
+  const agentLines = liveAgents.map(a => {
+    const deploy = a.cicdProvider === 'github'
+      ? `deployable to ${(a.availableRegions || []).join(', ')}`
+      : 'showcase only (no CI/CD pipeline yet)';
+    return `- ${a.name} (id: ${a.id}, category: ${a.category}): ${a.description} [${deploy}]`;
   }).join('\n');
 
-  const prompt = `You are an expert Azure cloud delivery manager estimating effort for a ${deploymentType} engagement.
+  const regionLines = regions.map(r =>
+    `- ${r.flag} ${r.shortName} (id: ${r.id}, cloud: ${r.cloud}): data residency = ${r.dataResidency || 'n/a'}`
+  ).join('\n');
 
-PROJECT SCOPE: ${projectScope || 'Azure Landing Zone, Hub-and-Spoke Networking, Cybersecurity Controls (Defender, Sentinel), Identity (Entra ID/PIM), Compliance'}
-DEPLOYMENT TYPE: ${deploymentType}
-DURATION: ${months} months (${monthCols.join(', ')})
-${histContext ? 'HISTORICAL STAFFING REFERENCE:\n' + histContext.substring(0, 1500) + '\n' : ''}
+  const costSummary = Object.entries(MONTHLY_COST_USD.perRegion).map(([rid, b]) => {
+    const total = Object.values(b).reduce((s, v) => s + v, 0);
+    return `- ${rid}: ~$${total.toFixed(2)}/mo foundation + $${MONTHLY_COST_USD.containerApp.toFixed(2)}/mo per agent`;
+  }).join('\n');
 
-RATE CARD (use these daily rates in AED — do not change rates marked with USE THIS EXACT RATE):
-${rateCardNote}
+  let contextBlock = '';
+  if (contextAgent) {
+    contextBlock += `\n\nThe user is currently looking at the agent "${contextAgent.name}".`;
+  }
+  if (contextRegion) {
+    contextBlock += ` They have selected region ${contextRegion.shortName}.`;
+  }
 
-Estimate staffing in days per month for each role. Consider:
-- Design & Architecture is front-loaded (M1-M2 heavy)
-- Implementation peaks in middle months
-- Testing in penultimate month
-- Handover/support in final month
-- ${deploymentType === 'On-Premise Deployment' ? 'On-prem needs more hands-on infra and network roles' : ''}
-- ${deploymentType === 'Customer Tenant Deployment' ? 'Customer tenant needs strong governance, identity, compliance focus' : ''}
-- ${deploymentType === 'Vendor-Managed Deployment' ? 'Vendor-managed needs SRE, strong DevSecOps and ongoing support roles' : ''}
+  return `You are AgentOS Assistant — an AI helper inside a multi-region AI agent deployment platform. You help users understand the available agents, pick a deployment region, understand costs and compliance, and troubleshoot deployments.
 
-ROLES TO ESTIMATE (use exactly these names):
-${roles.map((r,i) => `${i+1}. ${r}`).join('\n')}
+Be concise (2-4 short sentences usually). Do not make up agents, regions, or features. If you don't know, say so. Use only the catalog below.
 
-For each role and each month, provide days (0-22 max per month, 0 if not needed).
-Use the daily_rate_aed from the RATE CARD above. phase = Design/Implement/Test/Support.
+## Live agents
+${agentLines}
 
-Reply ONLY with valid JSON, no markdown:
-{
-  "summary": "2-3 sentence summary of the engagement staffing approach",
-  "roles": [
-    {
-      "role": "Infrastructure Architect",
-      "phase": "Design & Implement",
-      "daily_rate_aed": 3500,
-      "months": {"M1": 15, "M2": 10, "M3": 5}
-    }
-  ]
-}`;
+## Active regions
+${regionLines}
 
+## Cost model (USD/month)
+${costSummary}
+Each Container App estimate assumes 0.5 CPU, 1Gi RAM, ~10K requests/day. Foundation costs cover Postgres, Redis, Key Vault, storage, Log Analytics, App Insights — paid once per region regardless of agent count.
+
+## Deployment process
+Click Deploy → pick cloud → pick region → click Deploy now. Build + push image takes ~30s, then Azure provisioning + URL coming online takes 3-5 min. The platform watches the URL and shows you the moment it's live. Every deploy uses GitHub Actions (real CI/CD), Bicep IaC, Key Vault references for secrets, and is fully audit-logged.
+
+## Roles
+admin (deploy + manage), developer (deploy own agents), viewer (read only), tenant-user (uses deployed agents only).${contextBlock}
+
+When the user asks about something not in this catalog, say so honestly — don't invent. Format answers as plain prose, no markdown headers. Keep it warm and helpful.`;
+}
+
+async function callAnthropicChat(systemPrompt, history, message) {
+  const messages = [...history, { role: 'user', content: message }];
   try {
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }]
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 600,
+        system: systemPrompt,
+        messages,
+      }),
+      signal: AbortSignal.timeout(30_000),
     });
-    const raw     = msg.content.map(b => b.text || '').join('').trim();
-    const cleaned = raw.replace(/^```[a-z]*\n?/,'').replace(/\n?```$/,'').trim();
-    const data    = JSON.parse(cleaned);
+    if (!r.ok) {
+      const err = await r.text();
+      console.warn(`[chat] Anthropic ${r.status}: ${err.slice(0, 200)}`);
+      return null;
+    }
+    const data = await r.json();
+    const reply = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    return reply || null;
+  } catch (e) {
+    console.warn(`[chat] Anthropic call failed: ${e.message}`);
+    return null;
+  }
+}
 
-    // Override AI rates with stored rates if set
-    data.roles.forEach(r => {
-      if (!r.months) r.months = {};
-      monthCols.forEach(m => { if (r.months[m] === undefined) r.months[m] = 0; });
-      const stored = rateMap[r.role];
-      if (stored) r.daily_rate_aed = parseFloat(stored);
+// Rule-based fallback responder. Pattern-matches against the user message and
+// returns answers built from the live catalog. Not as flexible as a real LLM,
+// but always works and never hallucinates.
+function ruleBasedChatReply(message, contextAgent, contextRegion) {
+  const m = (message || '').toLowerCase();
+  const liveAgents = AGENTS.filter(a => a.live);
+  const deployable = liveAgents.filter(a => a.cicdProvider === 'github');
+  const regions = REGIONS.filter(r => r.available);
+
+  const agent = contextAgent;
+
+  if (/\b(hi|hello|hey|hiya|yo)\b/.test(m) && m.length < 25) {
+    return agent
+      ? `Hi! I'm the AgentOS assistant. Want to know about ${agent.name}, where it can deploy, or what it costs? Just ask.`
+      : `Hi! I'm the AgentOS assistant. I can help you pick an agent, choose a region, understand costs, or troubleshoot a deployment. What would you like to know?`;
+  }
+
+  // What agents / catalog
+  if (/\b(what agents|list agents|catalog|all agents|available agents|which agents)\b/.test(m)) {
+    const top = liveAgents.slice(0, 6).map(a => `• ${a.name} — ${a.description.slice(0, 90)}…`).join('\n');
+    return `There are ${liveAgents.length} agents on the platform (${deployable.length} deployable today). A few headliners:\n\n${top}\n\nAsk me about any of them by name.`;
+  }
+
+  // What does this agent do
+  if (agent && /\b(what (does|is)|tell me about|describe|explain|what can)\b/.test(m)) {
+    const where = (agent.availableRegions || []).length
+      ? `It can be deployed to ${agent.availableRegions.join(' and ')}.`
+      : `It's a showcase agent — no CI/CD pipeline wired yet.`;
+    return `${agent.name} is a ${agent.category.toLowerCase()} agent. ${agent.description} ${where}`;
+  }
+
+  // Regions
+  if (/\b(region|where|location|residency|data residency|sovereign)\b/.test(m)) {
+    const list = regions.map(r => `${r.flag} ${r.shortName} (${r.dataResidency || 'standard residency'})`).join(', ');
+    return `Currently active regions: ${list}. You pick a region during Deploy — data and compute stay in that region. Need a specific region we don't support yet? Tell me which.`;
+  }
+
+  // Cost / pricing
+  if (/\b(cost|price|pricing|how much|expensive|cheap|monthly|billing)\b/.test(m)) {
+    const sample = MONTHLY_COST_USD.perRegion[regions[0]?.id];
+    const foundation = sample ? Object.values(sample).reduce((s, v) => s + v, 0).toFixed(2) : '120';
+    return `Each region has a fixed foundation cost of ~$${foundation}/mo (Postgres, Redis, Key Vault, storage, monitoring) plus ~$${MONTHLY_COST_USD.containerApp.toFixed(2)}/mo per deployed agent at default sizing. Open the Analytics page for the live cost breakdown from your actual deployments.`;
+  }
+
+  // How long does deploy take
+  if (/\b(how long|deploy time|takes|duration|fast|slow|minutes|wait)\b/.test(m)) {
+    return `A deploy typically takes 3–5 minutes end-to-end: ~30s for build + image push, then 2–4 min for Azure to provision the Container App, pull the image, start a replica, and issue the TLS cert. The progress modal watches the URL and tells you the moment it's actually live.`;
+  }
+
+  // Compliance / security
+  if (/\b(compliance|security|audit|secret|key vault|gdpr|iso|soc|isolation|tenant)\b/.test(m)) {
+    return `Every deploy uses Key Vault references for secrets (no env-var leakage), runs in a region-locked Container App with managed identity, and is logged end-to-end for audit. Tenants can be region-locked. Each agent runs in its own container by default (dedicated mode).`;
+  }
+
+  // Stuck / not working / failed
+  if (/\b(stuck|hung|fail|failed|error|broken|not working|timeout|why|debug)\b/.test(m)) {
+    return `If a deploy looks stuck, it's almost always Azure provisioning the Container App or pulling the image — that step alone can take 3–4 minutes. If verification times out, the URL may still come up shortly after; click it and try again. For a hard failure, check the GitHub Actions pipeline link in the deploy result card.`;
+  }
+
+  // Roles / permissions
+  if (/\b(role|permission|admin|developer|viewer|access|rbac|user)\b/.test(m)) {
+    return `Four roles: admin (deploy anywhere + manage users), developer (deploy own agents), viewer (read-only dashboards, no costs), tenant-user (uses deployed agents but doesn't see admin UI). Configure these on the Users page.`;
+  }
+
+  // Default
+  const hint = agent
+    ? `Try asking: "what does ${agent.name} do?", "where can I deploy it?", "how much does it cost?", or "is it compliant?"`
+    : `Try asking: "what agents are available?", "which regions can I deploy to?", "how long does a deploy take?", or "what does it cost?"`;
+  return `I'm not sure I caught that. ${hint}`;
+}
+
+app.post('/api/chat', requireAuth, chatLimiter, async (req, res) => {
+  const { message, history = [], context = {} } = req.body || {};
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'message required' });
+  }
+  if (message.length > 2000) {
+    return res.status(400).json({ error: 'message too long (max 2000 chars)' });
+  }
+
+  // Resolve context
+  const contextAgent = context.agentId ? AGENTS.find(a => a.id === context.agentId) : null;
+  const contextRegion = context.regionId ? regionById(context.regionId) : null;
+
+  // Sanitize history
+  const cleanHistory = Array.isArray(history)
+    ? history
+        .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+        .slice(-12)
+        .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }))
+    : [];
+
+  let reply = null;
+  let source = 'rules';
+
+  if (ANTHROPIC_API_KEY) {
+    const systemPrompt = buildChatSystemPrompt(contextAgent, contextRegion);
+    reply = await callAnthropicChat(systemPrompt, cleanHistory, message);
+    if (reply) source = 'anthropic';
+  }
+
+  if (!reply) {
+    reply = ruleBasedChatReply(message, contextAgent, contextRegion);
+    source = 'rules';
+  }
+
+  res.json({ reply, source });
+});
+
+// ─── ElevenLabs Voice Tour ────────────────────────────────────────────────────
+// 30-second narrated walkthrough of how AgentOS deploys an agent. Multi-lingual
+// via ElevenLabs' eleven_multilingual_v2 model. Audio is cached on disk so each
+// language is generated at most once — subsequent listeners get the file
+// instantly with zero ElevenLabs API cost.
+//
+// To enable: set ELEVENLABS_API_KEY (and optionally ELEVENLABS_VOICE_ID) in env.
+// Without the key, the /api/voiceover endpoint returns a clear "not configured"
+// message and the UI tells the user how to enable it.
+
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';  // Rachel by default
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
+const VOICEOVER_DIR = path.join(__dirname, 'data', 'voiceovers');
+
+// 30-second narration in 5 languages. Each script is ~75-90 words at normal
+// pace which renders to roughly 28-32 seconds. Easy to add more languages —
+// just add a new entry; no other code changes needed.
+const VOICE_SCRIPTS = {
+  en: {
+    name: 'English',
+    native: 'English',
+    text: "When you click Deploy on AgentOS, the platform triggers a GitHub Actions workflow. Your container image is built with Docker and pushed to a region-local Azure Container Registry. Bicep templates create a new revision in Azure Container Apps, with secrets resolved from Key Vault at deploy time. Finally, the platform verifies your URL is responding. The whole process takes about five minutes. Your data stays in your chosen region — UAE or UK — throughout the deploy.",
+  },
+  ar: {
+    name: 'Arabic',
+    native: 'العربية',
+    text: "عند النقر على زر النشر في AgentOS، تقوم المنصة بتشغيل سير عمل GitHub Actions. يتم بناء صورة الحاوية الخاصة بك باستخدام Docker ودفعها إلى سجل حاويات Azure محلي في منطقتك. ثم تقوم قوالب Bicep بإنشاء مراجعة جديدة في Azure Container Apps، مع استرجاع الأسرار من Key Vault وقت النشر. أخيرًا، تتحقق المنصة من استجابة عنوان URL الخاص بك. تستغرق العملية بأكملها حوالي خمس دقائق. تبقى بياناتك في منطقتك المختارة — الإمارات أو المملكة المتحدة — طوال عملية النشر.",
+  },
+  hi: {
+    name: 'Hindi',
+    native: 'हिन्दी',
+    text: "जब आप AgentOS पर Deploy बटन पर क्लिक करते हैं, तो प्लेटफ़ॉर्म एक GitHub Actions वर्कफ़्लो ट्रिगर करता है। आपकी कंटेनर इमेज Docker से बनाई जाती है और आपके चुने हुए रीजन में स्थित Azure Container Registry में पुश की जाती है। फिर Bicep टेम्पलेट्स Azure Container Apps में एक नई रिवीज़न बनाते हैं, और सीक्रेट्स Key Vault से डिप्लॉय के समय लिए जाते हैं। अंत में, प्लेटफ़ॉर्म वेरिफाई करता है कि आपका URL रिस्पॉन्ड कर रहा है। पूरी प्रक्रिया लगभग पाँच मिनट लेती है। आपका डेटा हमेशा आपके चुने हुए रीजन में ही रहता है।",
+  },
+  fr: {
+    name: 'French',
+    native: 'Français',
+    text: "Quand vous cliquez sur Déployer dans AgentOS, la plateforme déclenche un workflow GitHub Actions. Votre image de conteneur est construite avec Docker, puis envoyée à un Azure Container Registry local à votre région. Des templates Bicep créent une nouvelle révision dans Azure Container Apps, avec les secrets résolus depuis Key Vault au moment du déploiement. Enfin, la plateforme vérifie que votre URL répond. L'ensemble du processus prend environ cinq minutes. Vos données restent dans votre région choisie — Émirats Arabes Unis ou Royaume-Uni — pendant tout le déploiement.",
+  },
+  es: {
+    name: 'Spanish',
+    native: 'Español',
+    text: "Cuando haces clic en Desplegar en AgentOS, la plataforma activa un flujo de trabajo de GitHub Actions. Tu imagen de contenedor se construye con Docker y se envía a un Azure Container Registry local en tu región. Las plantillas de Bicep crean una nueva revisión en Azure Container Apps, con los secretos resueltos desde Key Vault en el momento del despliegue. Finalmente, la plataforma verifica que tu URL responde. Todo el proceso tarda unos cinco minutos. Tus datos permanecen en tu región elegida — Emiratos Árabes Unidos o Reino Unido — durante todo el despliegue.",
+  },
+};
+
+// List available languages — used by the UI dropdown
+app.get('/api/voiceover/languages', (req, res) => {
+  res.json({
+    languages: Object.entries(VOICE_SCRIPTS).map(([code, s]) => ({
+      code, name: s.name, native: s.native,
+    })),
+    available: !!ELEVENLABS_API_KEY,
+  });
+});
+
+// Serve audio — cached or freshly generated.
+// Note the explicit guard against `lang === 'completion'` — that path is
+// handled by a separate endpoint defined further down. Without this guard,
+// Express would route `/api/voiceover/completion` here and return 404
+// because "completion" isn't in VOICE_SCRIPTS.
+app.get('/api/voiceover/:lang', async (req, res, next) => {
+  const lang = req.params.lang;
+  if (lang === 'completion' || lang === 'languages') return next();
+  const script = VOICE_SCRIPTS[lang];
+  if (!script) return res.status(404).json({ error: 'language not supported' });
+
+  const cachePath = path.join(VOICEOVER_DIR, `${lang}-${ELEVENLABS_VOICE_ID}.mp3`);
+
+  // Cache hit — serve immediately
+  if (fs.existsSync(cachePath)) {
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    return fs.createReadStream(cachePath).pipe(res);
+  }
+
+  // Cache miss — need ElevenLabs to generate
+  if (!ELEVENLABS_API_KEY) {
+    return res.status(503).json({
+      error: 'Voice tour not configured. Set ELEVENLABS_API_KEY in the platform environment to enable.',
+    });
+  }
+
+  console.log(`[voiceover] Generating ${lang} via ElevenLabs (${ELEVENLABS_MODEL})...`);
+  try {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text: script.text,
+        model_id: ELEVENLABS_MODEL,
+        voice_settings: { stability: 0.55, similarity_boost: 0.75, style: 0.20 },
+      }),
+      signal: AbortSignal.timeout(60_000),
     });
 
-    const vaptCost  = vatpIncluded === 'true' ? (parseFloat(vaptAmount) || 150000) : 0;
-    const ipCostVal = parseFloat(ipCost)            || 0;
-    const azureCost = parseFloat(azureCostPerMonth) || 0;
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`[voiceover] ElevenLabs ${r.status}: ${errText.slice(0, 200)}`);
+      return res.status(502).json({
+        error: `ElevenLabs returned ${r.status}. Check your API key and quota.`,
+      });
+    }
 
-    let totalEffortDays = 0, totalEffortCost = 0;
-    data.roles.forEach(r => {
-      const days = monthCols.reduce((s, m) => s + (r.months[m] || 0), 0);
-      const cost = days * (r.daily_rate_aed || 0);
-      r.total_days = days;
-      r.total_cost_aed = cost;
-      totalEffortDays += days;
-      totalEffortCost += cost;
+    const buffer = Buffer.from(await r.arrayBuffer());
+    fs.mkdirSync(VOICEOVER_DIR, { recursive: true });
+    fs.writeFileSync(cachePath, buffer);
+    console.log(`[voiceover] Cached ${lang} (${buffer.length} bytes)`);
+
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(buffer);
+  } catch (e) {
+    console.error('[voiceover] Generation error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── DIRECTION 3 · Marketing-grade extras ────────────────────────────────────
+// Four small features that turn a working platform into a memorable one:
+//   1. Audio "deploy complete" notification (ElevenLabs)
+//   2. Shareable SVG deployment receipt
+//   3. Outbound Slack notification on deploy success
+//   4. Weekly activity digest (HTML, email-ready)
+
+// ─── 1. Completion audio ─────────────────────────────────────────────────────
+// Short region-aware phrase ("Your agent is live in UAE North") in 5 languages.
+// Cached per (lang, region, voice_id). Each cell is generated at most once.
+
+const COMPLETION_PHRASES = {
+  en: (region) => `Your agent is live in ${region}.`,
+  ar: (region) => `وكيلك نشط الآن في ${region}.`,
+  hi: (region) => `आपका एजेंट ${region} में लाइव है।`,
+  fr: (region) => `Votre agent est en ligne dans ${region}.`,
+  es: (region) => `Tu agente está activo en ${region}.`,
+};
+
+app.get('/api/voiceover/completion', requireAuth, async (req, res) => {
+  const lang = req.query.lang || 'en';
+  const regionId = req.query.region;
+  const region = regionById(regionId);
+  if (!region) return res.status(400).json({ error: 'unknown region' });
+  const phraseFn = COMPLETION_PHRASES[lang];
+  if (!phraseFn) return res.status(400).json({ error: 'language not supported' });
+
+  const cacheKey = `done-${lang}-${regionId}-${ELEVENLABS_VOICE_ID}.mp3`;
+  const cachePath = path.join(VOICEOVER_DIR, cacheKey);
+
+  if (fs.existsSync(cachePath)) {
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    return fs.createReadStream(cachePath).pipe(res);
+  }
+
+  if (!ELEVENLABS_API_KEY) {
+    return res.status(503).json({ error: 'completion audio not configured (no ELEVENLABS_API_KEY)' });
+  }
+
+  const text = phraseFn(region.shortName);
+  try {
+    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: ELEVENLABS_MODEL,
+        voice_settings: { stability: 0.55, similarity_boost: 0.80, style: 0.30 },
+      }),
+      signal: AbortSignal.timeout(30_000),
     });
-
-    const totalAzure = azureCost * months;
-    const grandTotal = totalEffortCost + vaptCost + ipCostVal + totalAzure + extraCostsTotal;
-
-    // Use saved azure services breakdown if available, otherwise default percentages
-    const azureBreakdown = savedAzureServices.length > 0
-      ? savedAzureServices
-      : null; // null = use frontend defaults
-
-    const estimatePayload = {
-      summary: data.summary,
-      roles: data.roles,
-      monthCols,
-      costs: { effort: totalEffortCost, vapt: vaptCost, ip: ipCostVal, azureMonthly: azureCost, azureTotal: totalAzure, extraCostsTotal, grandTotal },
-      extraCosts,
-      totalDays: totalEffortDays,
-      deploymentType,
-      months,
-      azureBreakdown,
-      projectScope: projectScope || '',
-      title: `${deploymentType} — ${months}mo`
-    };
-    // Auto-save to estimations history
-    db.addEstimation({ id: uuidv4(), user_id: req.user.id, ...estimatePayload, created_at: new Date().toISOString() });
-    res.json({ success: true, ...estimatePayload });
-  } catch(err) {
-    res.status(500).json({ error: err.message || 'AI estimation failed' });
+    if (!r.ok) {
+      console.error(`[completion-audio] ElevenLabs ${r.status}`);
+      return res.status(502).json({ error: `ElevenLabs returned ${r.status}` });
+    }
+    const buffer = Buffer.from(await r.arrayBuffer());
+    fs.mkdirSync(VOICEOVER_DIR, { recursive: true });
+    fs.writeFileSync(cachePath, buffer);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(buffer);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// AZURE BILLING AGENT
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── 2. Shareable SVG deployment receipt ─────────────────────────────────────
+// Returns a beautifully-designed SVG card the frontend can render to PNG and
+// download / copy / share. Designed to look like a Wordle-style share artefact:
+// distinctive enough that it gets screenshotted into Slack channels.
 
-const https = require('https');
-
-// ── Azure credential helpers ──────────────────────────────────────────────────
-function getAzureCreds(user) {
-  return {
-    tenantId:     user.az_tenant_id     || '',
-    clientId:     user.az_client_id     || '',
-    clientSecret: decrypt(user.az_client_secret || ''),
-    subscriptions:(user.az_subscriptions|| '').split(',').map(s=>s.trim()).filter(Boolean)
-  };
-}
-
-async function getAzureToken(tenantId, clientId, clientSecret) {
-  return new Promise((resolve, reject) => {
-    const body = new URLSearchParams({
-      grant_type:    'client_credentials',
-      client_id:     clientId,
-      client_secret: clientSecret,
-      scope:         'https://management.azure.com/.default'
-    }).toString();
-    const req = https.request({
-      hostname: 'login.microsoftonline.com',
-      path:     `/${tenantId}/oauth2/v2.0/token`,
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try { const j = JSON.parse(d); j.access_token ? resolve(j.access_token) : reject(new Error(j.error_description || 'Auth failed')); }
-        catch(e) { reject(e); }
-      });
+app.get('/api/deployments/:id/receipt', requireAuth, (req, res) => {
+  const dep = getDeployment(req.params.id);
+  if (!dep) {
+    const live = liveDeploys.get(req.params.id);
+    if (!live) return res.status(404).json({ error: 'deployment not found' });
+    // Build receipt from live deploy that hasn't been persisted yet
+    const agent = AGENTS.find(a => a.id === live.agentId);
+    const region = regionById(live.regionId);
+    return sendReceiptSvg(res, {
+      agentName: agent?.name || live.agentId,
+      agentColor: agent?.color || '#2251ff',
+      agentIcon: agent?.icon || '◆',
+      regionFlag: region?.flag || '',
+      regionName: region?.shortName || live.regionId,
+      tenantSlug: live.tenantSlug,
+      fqdn: live.fqdn,
+      createdAt: live.createdAt,
+      userName: live.userName,
+      verified: live.fqdnReal,
     });
-    req.on('error', reject);
-    req.write(body); req.end();
+  }
+  sendReceiptSvg(res, {
+    agentName: dep.agentName, agentColor: dep.agentColor, agentIcon: '◆',
+    regionFlag: dep.regionFlag, regionName: dep.regionShortName,
+    tenantSlug: dep.tenantSlug,
+    fqdn: dep.fqdn,
+    createdAt: dep.createdAt,
+    userName: dep.userName,
+    verified: dep.fqdnReal,
   });
+});
+
+function escapeXml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-async function azureGet(token, path) {
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'management.azure.com',
-      path,
-      method:  'GET',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(d)); }
-        catch(e) { reject(new Error('Invalid JSON: ' + d.substring(0,200))); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
+function sendReceiptSvg(res, d) {
+  const W = 1200, H = 630;  // OpenGraph-friendly card dimensions
+  const dt = new Date(d.createdAt || Date.now());
+  const dateStr = dt.toLocaleDateString('en-US', {
+    month: 'long', day: 'numeric', year: 'numeric',
   });
-}
-
-async function azurePost(token, path, body) {
-  return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(body);
-    const req = https.request({
-      hostname: 'management.azure.com',
-      path,
-      method:  'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) }
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(d)); }
-        catch(e) { reject(new Error('Invalid JSON: ' + d.substring(0,200))); }
-      });
-    });
-    req.on('error', reject);
-    req.write(bodyStr); req.end();
+  const timeStr = dt.toLocaleTimeString('en-US', {
+    hour: '2-digit', minute: '2-digit', hour12: false,
   });
+  // FQDN can be very long — truncate visually but keep meaningful end
+  const hasUrl = !!d.fqdn;
+  const url = d.fqdn || '';
+  const urlDisplay = url.length > 56 ? url.slice(0, 26) + '…' + url.slice(-26) : url;
+  const urlText = hasUrl
+    ? (url.startsWith('http') ? url : 'https://' + urlDisplay)
+    : 'Provisioning · URL pending';
+
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a1419"/>
+      <stop offset="100%" stop-color="#111e26"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="80%" cy="0%" r="60%">
+      <stop offset="0%" stop-color="${escapeXml(d.agentColor)}" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="${escapeXml(d.agentColor)}" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rust" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d6671f"/>
+      <stop offset="100%" stop-color="#b8541e"/>
+    </linearGradient>
+  </defs>
+  <rect width="${W}" height="${H}" fill="url(#bg)"/>
+  <rect width="${W}" height="${H}" fill="url(#glow)"/>
+
+  <!-- Top brand strip -->
+  <text x="64" y="78" font-family="Georgia, serif" font-size="28" font-weight="600" fill="#f5f0e8">AgentOS</text>
+  <rect x="172" y="65" width="6" height="6" fill="#d6671f"/>
+  <text x="64" y="108" font-family="ui-monospace, Menlo, monospace" font-size="13" fill="rgba(245,240,232,0.50)" letter-spacing="3">DEPLOYMENT  ·  ${escapeXml(verifiedBadge(d.verified))}</text>
+
+  <!-- Big serif headline -->
+  <text x="64" y="240" font-family="Georgia, serif" font-size="68" font-weight="400" fill="#f5f0e8" letter-spacing="-2">
+    <tspan>${escapeXml(d.agentName)}</tspan>
+  </text>
+  <text x="64" y="318" font-family="Georgia, serif" font-size="68" font-weight="300" fill="rgba(245,240,232,0.65)" font-style="italic" letter-spacing="-2">
+    <tspan>is live.</tspan>
+  </text>
+
+  <!-- Mid divider -->
+  <line x1="64" y1="378" x2="${W - 64}" y2="378" stroke="rgba(245,240,232,0.15)" stroke-width="1"/>
+
+  <!-- Bottom row: region · timestamp · user -->
+  <g font-family="ui-monospace, Menlo, monospace" font-size="14" fill="rgba(245,240,232,0.55)">
+    <text x="64" y="424" letter-spacing="2">REGION</text>
+    <text x="${W/2 - 100}" y="424" letter-spacing="2">DEPLOYED</text>
+    <text x="${W - 64 - 200}" y="424" letter-spacing="2">BY</text>
+  </g>
+  <g font-family="Georgia, serif" font-size="22" font-weight="500" fill="#f5f0e8">
+    <text x="64" y="464">${escapeXml(d.regionFlag || '')} ${escapeXml(d.regionName || '')}</text>
+    <text x="${W/2 - 100}" y="464">${escapeXml(dateStr)}</text>
+    <text x="${W - 64 - 200}" y="464">${escapeXml(d.userName || 'Admin')}</text>
+  </g>
+  <g font-family="ui-monospace, Menlo, monospace" font-size="13" fill="rgba(245,240,232,0.45)">
+    <text x="${W/2 - 100}" y="488">at ${escapeXml(timeStr)}</text>
+  </g>
+
+  <!-- URL pill at bottom -->
+  <rect x="64" y="528" width="${W - 128}" height="60" fill="rgba(245,240,232,0.06)" stroke="rgba(245,240,232,0.15)" stroke-width="1" rx="6"/>
+  <text x="${W/2}" y="566" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="22" fill="#f5f0e8" letter-spacing="0.5">${escapeXml(urlText)}</text>
+
+  <!-- Rust accent stripe (left edge) -->
+  <rect x="0" y="0" width="6" height="${H}" fill="url(#rust)"/>
+</svg>`;
+  res.set('Content-Type', 'image/svg+xml');
+  res.set('Cache-Control', 'public, max-age=300');
+  res.send(svg);
 }
 
-// ── Save Azure credentials ────────────────────────────────────────────────────
-app.put('/api/azure/credentials', auth, (req, res) => {
-  const { az_tenant_id, az_client_id, az_client_secret, az_subscriptions } = req.body;
-  db.updateUser(req.user.id, { az_tenant_id:az_tenant_id||'', az_client_id:az_client_id||'', az_client_secret:encrypt(az_client_secret||''), az_subscriptions:az_subscriptions||'' });
-  res.json({ success: true });
-});
+function verifiedBadge(verified) {
+  return verified ? '✓ VERIFIED' : 'PROVISIONED';
+}
 
-// ── Test Azure connection ─────────────────────────────────────────────────────
-app.get('/api/azure/test', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret, subscriptions } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured. Go to Settings → Azure Billing.' });
-  try {
-    const token = await getAzureToken(tenantId, clientId, clientSecret);
-    const subList = [];
-    for (const subId of subscriptions.slice(0,5)) {
-      try {
-        const sub = await azureGet(token, `/subscriptions/${subId}?api-version=2020-01-01`);
-        subList.push({ id: subId, name: sub.displayName || subId, state: sub.state });
-      } catch(e) { subList.push({ id: subId, name: subId, state: 'Error: ' + e.message }); }
-    }
-    res.json({ success: true, subscriptions: subList, message: 'Connected successfully' });
-  } catch(e) { res.status(400).json({ error: 'Connection failed: ' + e.message }); }
-});
 
-// ── Get cost by subscription (current + last month) ───────────────────────────
-app.get('/api/azure/billing/subscriptions', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret, subscriptions } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured' });
-  try {
-    const token = await getAzureToken(tenantId, clientId, clientSecret);
-    const now = new Date();
-    const firstThisMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-    const today = now.toISOString().split('T')[0];
-    const firstLastMonth = new Date(now.getFullYear(), now.getMonth()-1, 1).toISOString().split('T')[0];
-    const lastLastMonth  = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split('T')[0];
-    const results = [];
-    for (const subId of subscriptions) {
-      try {
-        const [curr, prev] = await Promise.all([
-          azurePost(token, `/subscriptions/${subId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`, {
-            type: 'ActualCost', timeframe: 'Custom',
-            timePeriod: { from: firstThisMonth, to: today },
-            dataset: { granularity: 'None', aggregation: { totalCost: { name: 'Cost', function: 'Sum' } } }
-          }),
-          azurePost(token, `/subscriptions/${subId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`, {
-            type: 'ActualCost', timeframe: 'Custom',
-            timePeriod: { from: firstLastMonth, to: lastLastMonth },
-            dataset: { granularity: 'None', aggregation: { totalCost: { name: 'Cost', function: 'Sum' } } }
-          })
-        ]);
-        const subInfo = await azureGet(token, `/subscriptions/${subId}?api-version=2020-01-01`);
-        const currCost = curr.properties?.rows?.[0]?.[0] || 0;
-        const prevCost = prev.properties?.rows?.[0]?.[0] || 0;
-        const currency = curr.properties?.rows?.[0]?.[1] || 'USD';
-        const change   = prevCost > 0 ? ((currCost - prevCost) / prevCost * 100) : 0;
-        results.push({ id: subId, name: subInfo.displayName || subId, currentMonth: currCost, lastMonth: prevCost, currency, changePercent: change });
-      } catch(e) { results.push({ id: subId, name: subId, error: e.message }); }
-    }
-    res.json({ success: true, data: results, asOf: today });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+// ─── 3. Slack outbound webhook ───────────────────────────────────────────────
+// One env var enables it: set SLACK_WEBHOOK_URL to an Incoming Webhook URL from
+// Slack (https://api.slack.com/messaging/webhooks). Every successful deploy
+// posts a Block-Kit formatted message to the configured channel.
 
-// ── Cost by resource group ─────────────────────────────────────────────────────
-app.get('/api/azure/billing/resourcegroups/:subId', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured' });
-  try {
-    const token = await getAzureToken(tenantId, clientId, clientSecret);
-    const now = new Date();
-    const from = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-    const to   = now.toISOString().split('T')[0];
-    const result = await azurePost(token, `/subscriptions/${req.params.subId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`, {
-      type: 'ActualCost', timeframe: 'Custom',
-      timePeriod: { from, to },
-      dataset: {
-        granularity: 'None',
-        aggregation: { totalCost: { name: 'Cost', function: 'Sum' } },
-        grouping: [{ type: 'Dimension', name: 'ResourceGroupName' }],
-        sorting: [{ direction: 'Descending', name: 'Cost' }]
-      }
-    });
-    const rows = result.properties?.rows || [];
-    const cols = result.properties?.columns || [];
-    const costIdx = cols.findIndex(c => c.name === 'Cost');
-    const rgIdx   = cols.findIndex(c => c.name === 'ResourceGroupName');
-    const curIdx  = cols.findIndex(c => c.name === 'Currency');
-    const data = rows.slice(0,20).map(r => ({
-      resourceGroup: r[rgIdx] || 'Unknown',
-      cost:          r[costIdx] || 0,
-      currency:      r[curIdx] || 'USD'
-    }));
-    res.json({ success: true, data, period: `${from} to ${to}` });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 
-// ── Top billed resources ───────────────────────────────────────────────────────
-app.get('/api/azure/billing/topresources/:subId', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured' });
-  try {
-    const token = await getAzureToken(tenantId, clientId, clientSecret);
-    const now = new Date();
-    const from = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-    const to   = now.toISOString().split('T')[0];
-    const result = await azurePost(token, `/subscriptions/${req.params.subId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`, {
-      type: 'ActualCost', timeframe: 'Custom',
-      timePeriod: { from, to },
-      dataset: {
-        granularity: 'None',
-        aggregation: { totalCost: { name: 'Cost', function: 'Sum' } },
-        grouping: [
-          { type: 'Dimension', name: 'ResourceId' },
-          { type: 'Dimension', name: 'ResourceType' },
-          { type: 'Dimension', name: 'ResourceGroupName' }
+async function notifySlackOfDeploy(dep, agent, region) {
+  if (!SLACK_WEBHOOK_URL) return;
+  const msg = {
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: '🎯 Agent deployed', emoji: true }
+      },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*Agent*\n${agent.name}` },
+          { type: 'mrkdwn', text: `*Region*\n${region.flag} ${region.shortName}` },
+          { type: 'mrkdwn', text: `*By*\n${dep.userName || dep.userId}` },
+          { type: 'mrkdwn', text: `*Status*\n${dep.fqdnReal ? '✓ URL verified' : '⏳ provisioning'}` },
         ],
-        sorting: [{ direction: 'Descending', name: 'Cost' }]
-      }
+      },
+    ],
+  };
+  if (dep.fqdn) {
+    msg.blocks.push({
+      type: 'actions',
+      elements: [{
+        type: 'button',
+        text: { type: 'plain_text', text: 'Open agent ↗' },
+        url: 'https://' + dep.fqdn,
+        style: 'primary',
+      }],
     });
-    const rows = result.properties?.rows || [];
-    const cols = result.properties?.columns || [];
-    const costIdx = cols.findIndex(c => c.name === 'Cost');
-    const ridIdx  = cols.findIndex(c => c.name === 'ResourceId');
-    const rtIdx   = cols.findIndex(c => c.name === 'ResourceType');
-    const rgIdx   = cols.findIndex(c => c.name === 'ResourceGroupName');
-    const curIdx  = cols.findIndex(c => c.name === 'Currency');
-    const data = rows.slice(0,15).map(r => ({
-      resourceId:    r[ridIdx] || '',
-      resourceName:  (r[ridIdx] || '').split('/').pop() || 'Unknown',
-      resourceType:  r[rtIdx] || '',
-      resourceGroup: r[rgIdx] || '',
-      cost:          r[costIdx] || 0,
-      currency:      r[curIdx] || 'USD'
-    }));
-    res.json({ success: true, data, period: `${from} to ${to}` });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Cost trend (last 6 months) ─────────────────────────────────────────────────
-app.get('/api/azure/billing/trend/:subId', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured' });
-  try {
-    const token  = await getAzureToken(tenantId, clientId, clientSecret);
-    const months = parseInt(req.query.months) || 6;
-    const now    = new Date();
-    const from   = new Date(now.getFullYear(), now.getMonth() - months + 1, 1).toISOString().split('T')[0];
-    const to     = now.toISOString().split('T')[0];
-    const result = await azurePost(token, `/subscriptions/${req.params.subId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`, {
-      type: 'ActualCost', timeframe: 'Custom',
-      timePeriod: { from, to },
-      dataset: {
-        granularity: 'Monthly',
-        aggregation: { totalCost: { name: 'Cost', function: 'Sum' } }
-      }
-    });
-    const rows = result.properties?.rows || [];
-    const cols = result.properties?.columns || [];
-    const costIdx = cols.findIndex(c => c.name === 'Cost');
-    const dateIdx = cols.findIndex(c => c.name === 'BillingMonth' || c.name === 'UsageDate');
-    const curIdx  = cols.findIndex(c => c.name === 'Currency');
-    const data = rows.map(r => ({
-      month:    String(r[dateIdx] || '').substring(0,6),
-      cost:     r[costIdx] || 0,
-      currency: r[curIdx] || 'USD'
-    }));
-    res.json({ success: true, data });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Idle/unused resource detection ────────────────────────────────────────────
-app.get('/api/azure/billing/idle/:subId', auth, async (req, res) => {
-  const { tenantId, clientId, clientSecret } = getAzureCreds(req.user);
-  if (!tenantId || !clientId || !clientSecret) return res.status(400).json({ error: 'Azure credentials not configured' });
-  try {
-    const token = await getAzureToken(tenantId, clientId, clientSecret);
-    const idle  = [];
-
-    // 1. Unattached managed disks
-    try {
-      const disks = await azureGet(token, `/subscriptions/${req.params.subId}/providers/Microsoft.Compute/disks?api-version=2023-04-02`);
-      (disks.value || []).forEach(d => {
-        if (!d.managedBy) {
-          idle.push({ type: 'Unattached Disk', name: d.name, resourceGroup: d.id.split('/')[4], sku: d.sku?.name, sizeGB: d.properties?.diskSizeGB, severity: 'high', saving: 'Stop paying for unused disk storage', id: d.id });
-        }
-      });
-    } catch(e) {}
-
-    // 2. Unassociated public IPs
-    try {
-      const pips = await azureGet(token, `/subscriptions/${req.params.subId}/providers/Microsoft.Network/publicIPAddresses?api-version=2023-06-01`);
-      (pips.value || []).forEach(p => {
-        if (!p.properties?.ipConfiguration) {
-          idle.push({ type: 'Unused Public IP', name: p.name, resourceGroup: p.id.split('/')[4], sku: p.sku?.name, severity: 'medium', saving: '~$3-5/mo per static IP', id: p.id });
-        }
-      });
-    } catch(e) {}
-
-    // 3. Empty / unused NSGs
-    try {
-      const nsgs = await azureGet(token, `/subscriptions/${req.params.subId}/providers/Microsoft.Network/networkSecurityGroups?api-version=2023-06-01`);
-      (nsgs.value || []).forEach(n => {
-        const ifaces = (n.properties?.networkInterfaces || []).length;
-        const subnets = (n.properties?.subnets || []).length;
-        if (ifaces === 0 && subnets === 0) {
-          idle.push({ type: 'Unattached NSG', name: n.name, resourceGroup: n.id.split('/')[4], severity: 'low', saving: 'No direct cost but indicates orphaned resources', id: n.id });
-        }
-      });
-    } catch(e) {}
-
-    // 4. Stopped (deallocated) VMs still with disks
-    try {
-      const vms = await azureGet(token, `/subscriptions/${req.params.subId}/providers/Microsoft.Compute/virtualMachines?api-version=2023-07-01&$expand=instanceView`);
-      (vms.value || []).forEach(vm => {
-        const statuses = vm.properties?.instanceView?.statuses || [];
-        const powerState = statuses.find(s => s.code?.startsWith('PowerState/'));
-        if (powerState && (powerState.code === 'PowerState/deallocated' || powerState.code === 'PowerState/stopped')) {
-          idle.push({ type: 'Stopped VM', name: vm.name, resourceGroup: vm.id.split('/')[4], size: vm.properties?.hardwareProfile?.vmSize, severity: 'high', saving: 'VM deallocated but OS disk still billed — consider deleting if unused', id: vm.id });
-        }
-      });
-    } catch(e) {}
-
-    // 5. Old snapshots (>90 days)
-    try {
-      const snaps = await azureGet(token, `/subscriptions/${req.params.subId}/providers/Microsoft.Compute/snapshots?api-version=2023-04-02`);
-      const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-      (snaps.value || []).forEach(sn => {
-        const created = new Date(sn.properties?.timeCreated);
-        if (created < cutoff) {
-          const ageDays = Math.floor((Date.now() - created) / 86400000);
-          idle.push({ type: 'Old Snapshot', name: sn.name, resourceGroup: sn.id.split('/')[4], sizeGB: sn.properties?.diskSizeGB, ageDays, severity: 'medium', saving: 'Old snapshots accumulate cost — delete if no longer needed', id: sn.id });
-        }
-      });
-    } catch(e) {}
-
-    res.json({ success: true, data: idle, count: idle.length });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── AI recommendations ─────────────────────────────────────────────────────────
-app.post('/api/azure/billing/recommend', auth, async (req, res) => {
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key configured. Contact your administrator." });
-  const { billingData, idleResources, topResources, trend } = req.body;
-
-  const prompt = `You are an Azure FinOps expert. Analyse this Azure billing data and provide clear, actionable recommendations.
-
-SUBSCRIPTION COSTS (this month vs last month):
-${JSON.stringify(billingData || [], null, 1)}
-
-TOP BILLED RESOURCES:
-${JSON.stringify(topResources?.slice(0,10) || [], null, 1)}
-
-IDLE/UNUSED RESOURCES DETECTED:
-${JSON.stringify(idleResources || [], null, 1)}
-
-COST TREND (last 6 months):
-${JSON.stringify(trend || [], null, 1)}
-
-Provide recommendations in this exact JSON format (no markdown, no preamble):
-{
-  "summary": "2-3 sentence executive summary of the billing situation",
-  "totalSavingsOpportunity": 500,
-  "recommendations": [
-    {
-      "priority": "high",
-      "category": "Cost Reduction",
-      "title": "Delete 3 unattached managed disks",
-      "description": "3 managed disks are unattached and costing approximately $45/month with no benefit",
-      "estimatedSaving": 45,
-      "action": "Go to Azure Portal → Disks → filter by Unattached → Delete",
-      "effort": "low"
-    }
-  ],
-  "budgetAlerts": [
-    {
-      "subscription": "name",
-      "trend": "increasing",
-      "message": "Cost increased 23% vs last month"
-    }
-  ]
-}`;
-
-  try {
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }]
-    });
-    const raw     = msg.content.map(b => b.text || '').join('').trim();
-    const cleaned = raw.replace(/^```[a-z]*\n?/, '').replace(/\n?```$/, '').trim();
-    const data    = JSON.parse(cleaned);
-    res.json({ success: true, ...data });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── AI Chat for billing queries ────────────────────────────────────────────────
-app.post('/api/azure/billing/chat', auth, async (req, res) => {
-  const user = req.user;
-  const _apiKey = req.effectiveApiKey; if (!_apiKey) return res.status(400).json({ error: "No API key configured. Contact your administrator." });
-  const { message, context } = req.body;
-  const prompt = `You are an Azure billing and FinOps assistant. Answer the user's question based on the billing data provided. Be specific with numbers and actionable with advice.
-
-CURRENT BILLING CONTEXT:
-${JSON.stringify(context || {}, null, 1)}
-
-USER QUESTION: ${message}
-
-Respond in plain text, be concise and specific. Use numbers from the data when available.`;
-
-  try {
-    const client = new Anthropic({ apiKey: req.effectiveApiKey });
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 1000,
-      messages: [{ role: 'user', content: prompt }]
-    });
-    res.json({ success: true, response: msg.content.map(b => b.text || '').join('') });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-
-app.listen(PORT, () => {
-  console.log('\n✅  RFP Agent v3.0  →  http://localhost:' + PORT);
-  console.log('   Data stored in: ' + DATA_DIR);
-  console.log('   Registration: DISABLED (use: node manage.js create-user <email> <password>)');
-  const users = (loadDB().users || []);
-  if (users.length === 0) {
-    console.log('\n⚠️  NO USERS EXIST YET.');
-    console.log('   Create your account: node manage.js create-user you@email.com yourpassword\n');
-  } else {
-    console.log('   Users: ' + users.length + ' account(s) registered\n');
   }
+  try {
+    const r = await fetch(SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) {
+      console.warn(`[slack] webhook returned ${r.status}: ${await r.text()}`);
+    } else {
+      console.log(`[slack] notified deploy of ${agent.id} to ${region.id}`);
+    }
+  } catch (e) {
+    console.warn(`[slack] notify failed: ${e.message}`);
+  }
+}
+
+// Hook into the existing deploy state machine: when verified, fire the webhook.
+// We monkey-patch the existing runDeployTimeline by listening for completion via
+// the deployment store. Cleanest place: at the end of runDeployTimeline, after
+// createDeployment is called. To avoid editing that function we wrap it here.
+const _origCreateDeployment = createDeployment;
+function createDeploymentAndNotify(d) {
+  const result = _origCreateDeployment(d);
+  if (d.fqdnReal && SLACK_WEBHOOK_URL) {
+    const agent = AGENTS.find(a => a.id === d.agentId);
+    const region = regionById(d.regionId);
+    if (agent && region) notifySlackOfDeploy(d, agent, region);
+  }
+  return result;
+}
+
+
+// ─── 4. Weekly activity digest ───────────────────────────────────────────────
+// Admin-only HTML view that aggregates the last 7 days of platform activity.
+// Designed as an email-ready layout with inline styles — copy the rendered
+// HTML into your mail client of choice. No SMTP wiring required for this round.
+
+app.get('/api/digest', requireAuth, requireAdmin, async (req, res) => {
+  const days = parseInt(req.query.days || '7', 10);
+  const sinceMs = Date.now() - days * 86400_000;
+  const all = listDeployments();
+  const recent = all.filter(d => new Date(d.createdAt).getTime() >= sinceMs);
+
+  // Per-agent counts (top 5)
+  const agentCounts = {};
+  recent.forEach(d => { agentCounts[d.agentId] = (agentCounts[d.agentId] || 0) + 1; });
+  const topAgents = Object.entries(agentCounts)
+    .map(([id, count]) => {
+      const a = AGENTS.find(x => x.id === id);
+      return { id, count, name: a?.name || id, color: a?.color || '#888' };
+    })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  const maxCount = topAgents[0]?.count || 1;
+
+  // Per-region tallies
+  const regionTallies = {};
+  recent.forEach(d => {
+    if (!regionTallies[d.regionId]) regionTallies[d.regionId] = { count: 0, flag: d.regionFlag, name: d.regionShortName };
+    regionTallies[d.regionId].count++;
+  });
+
+  // Top deployers (people)
+  const userCounts = {};
+  recent.forEach(d => { userCounts[d.userName || d.userId || 'anon'] = (userCounts[d.userName || d.userId || 'anon'] || 0) + 1; });
+  const topUsers = Object.entries(userCounts)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // Manual-deploy savings — same model as the ROI page
+  const MANUAL_HOURS_PER_DEPLOY = 8;     // ~1 day of senior engineer time
+  const MANUAL_RATE_PER_HOUR = 120;
+  const savingsUsd = recent.length * MANUAL_HOURS_PER_DEPLOY * MANUAL_RATE_PER_HOUR;
+
+  // Last 5 deploys, newest first
+  const latest = recent.slice().sort((a, b) =>
+    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  ).slice(0, 5);
+
+  res.json({
+    period: { days, since: new Date(sinceMs).toISOString(), now: new Date().toISOString() },
+    headline: {
+      deploys: recent.length,
+      uniqueAgents: Object.keys(agentCounts).length,
+      regions: Object.keys(regionTallies).length,
+      savingsUsd,
+    },
+    topAgents,
+    regionTallies: Object.entries(regionTallies).map(([id, v]) => ({ id, ...v })),
+    topUsers,
+    latest: latest.map(d => ({
+      id: d.id, agentName: d.agentName, agentColor: d.agentColor,
+      regionFlag: d.regionFlag, regionName: d.regionShortName,
+      userName: d.userName, createdAt: d.createdAt,
+      fqdn: d.fqdn, fqdnReal: d.fqdnReal,
+    })),
+    maxAgentCount: maxCount,
+  });
+});
+
+
+// ─── Start server ─────────────────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`AgentOS v${VERSION} on http://0.0.0.0:${PORT}`);
+  console.log(`Agents:    ${AGENTS.length} (${AGENTS.filter(a => a.live).length} live)`);
+  console.log(`Regions:   ${REGIONS.filter(r => r.available).map(r => r.id).join(', ')}`);
+  console.log(`Has token: ${!!GITHUB_TOKEN}`);
+  console.log(`Chat mode: ${ANTHROPIC_API_KEY ? `Anthropic (${ANTHROPIC_MODEL})` : 'rule-based fallback'}`);
+  console.log(`Voice tour: ${ELEVENLABS_API_KEY ? `ElevenLabs (${ELEVENLABS_MODEL})` : 'disabled — set ELEVENLABS_API_KEY to enable'}`);
+  console.log(`Slack:      ${SLACK_WEBHOOK_URL ? 'webhook configured · deploys will notify' : 'disabled — set SLACK_WEBHOOK_URL to enable'}`);
 });

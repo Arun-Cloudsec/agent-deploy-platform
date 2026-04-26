@@ -8,13 +8,19 @@
 # context and execute on the runner. Env-var indirection neutralizes that.
 # See: https://securitylab.github.com/research/github-actions-untrusted-input/
 
-name: RFP Agent — Build & Deploy
+name: Agent — Build & Deploy
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
+      agent_id:
+        description: 'Agent identifier (matches src/agents-with-repos.js id; used as image name and Container App name)'
+        required: true
+        default: 'rfp-agent'
+      source_repo:
+        description: 'Source repo containing Dockerfile + app code (within the same org)'
+        required: true
+        default: 'rfp'
       target_cloud:
         description: 'Target cloud (azure | aws)'
         required: false
@@ -43,7 +49,11 @@ permissions:
   contents: read
 
 env:
-  AGENT_ID: rfp-agent
+  # AGENT_ID and SOURCE_REPO come from workflow inputs (populated by the
+  # marketplace at dispatch time). The marketplace knows which agent + repo
+  # combo to deploy from src/agents-with-repos.js.
+  AGENT_ID: ${{ inputs.agent_id }}
+  SOURCE_REPO: ${{ inputs.source_repo }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
@@ -146,7 +156,22 @@ jobs:
     outputs:
       image: ${{ steps.meta.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
+      # Check out the AGENT'S source repo, not this workflow's repo. The
+      # source_repo input is set by the marketplace from agents-with-repos.js
+      # (e.g. 'rfp', 'openclaw'). The deploy workflow itself lives here in
+      # agent-deploy-platform, but the code we BUILD comes from the agent repo.
+      - name: Checkout source repo (${{ inputs.source_repo }})
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.source_repo }}
+          # Marketplace runs as ${{ secrets.GITHUB_TOKEN }} which works for
+          # public repos in the same org. For private repos, swap this for a
+          # PAT with `contents:read` on the agent repo.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Don't leave the token in .git/config — subsequent steps don't need
+          # to push, and persisted creds widen the blast radius if a later
+          # action is compromised. (zizmor: credential-persistence)
+          persist-credentials: false
       - uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
@@ -272,7 +297,12 @@ jobs:
     outputs:
       image_uri: ${{ steps.push.outputs.image_uri }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source repo (${{ inputs.source_repo }})
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.source_repo }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:

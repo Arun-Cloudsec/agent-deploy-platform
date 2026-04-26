@@ -32,7 +32,7 @@ export const AGENTS = [
     tags: ['rfp', 'drafting', 'multi-agent', 'sales'],
     showcaseUrl: 'https://rfp-agent-production.up.railway.app/',
     cicdProvider: 'github',
-    githubRepo: 'agent-deploy-platform',
+    githubRepo: 'rfp',
     workflowName: 'deploy-agent.yml',
     live: true,
     // Region-aware deploys — workflow routes to the right cloud + region

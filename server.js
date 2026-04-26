@@ -312,11 +312,19 @@ async function probePublicUrl(name, region) {
 // ─── GitHub workflow dispatch ─────────────────────────────────────────────────
 async function triggerGitHubWorkflow(agent, region, deploymentId, tenantSlug) {
   if (!GITHUB_TOKEN) return { error: 'Platform missing GITHUB_TOKEN' };
-  const url = `https://api.github.com/repos/${GITHUB_ORG}/${agent.githubRepo}` +
+  // The deploy-agent.yml workflow lives in the marketplace repo
+  // (agent-deploy-platform), not in each agent's repo. We always dispatch
+  // against the marketplace repo and pass the agent's source repo as an
+  // input — the workflow then checks out THAT repo to build the image.
+  // This keeps a single source of truth for deploy logic across all agents.
+  const MARKETPLACE_REPO = 'agent-deploy-platform';
+  const url = `https://api.github.com/repos/${GITHUB_ORG}/${MARKETPLACE_REPO}` +
               `/actions/workflows/${agent.workflowName}/dispatches`;
   const body = {
     ref: 'main',
     inputs: {
+      agent_id: agent.id,
+      source_repo: agent.githubRepo,
       target_cloud: region.cloud || 'azure',
       target_region: region.region,
       tenant_slug: tenantSlug || '',
@@ -338,7 +346,7 @@ async function triggerGitHubWorkflow(agent, region, deploymentId, tenantSlug) {
     });
     if (r.status === 204) {
       console.log('[trigger] ✓ Dispatched');
-      return { success: true, runUrl: `https://github.com/${GITHUB_ORG}/${agent.githubRepo}/actions` };
+      return { success: true, runUrl: `https://github.com/${GITHUB_ORG}/${MARKETPLACE_REPO}/actions` };
     }
     const errText = await r.text();
     let parsed = errText;

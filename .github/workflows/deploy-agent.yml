@@ -196,10 +196,27 @@ jobs:
           # Re-sanitize defensively (the resolve job validated, but env
           # vars cross job boundaries via Actions outputs — re-validate).
           SAFE_SLUG="$(echo "$INPUT_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-24)"
+
+          # Generate a fresh SESSION_SECRET for this agent. server.js (v6.10+)
+          # refuses to start in production without one set. We use openssl since
+          # it ships with the runner image and produces 32 bytes of crypto-grade
+          # randomness — overkill for cookie signing but cheap.
+          SESSION_SECRET="$(openssl rand -hex 32)"
+
           if az containerapp show --name "$APP" --resource-group "$RG" >/dev/null 2>&1; then
-            echo "→ Container App exists — updating image"
+            echo "→ Container App exists — updating image and ensuring SESSION_SECRET is set"
+            # Set/refresh the secret on the existing app. If the secret already
+            # exists with a different value, this overwrites it — fine, sessions
+            # rotate and the user re-logs-in. If the env var binding wasn't
+            # there from a pre-v6.10 deploy, this `update --set-env-vars` adds
+            # it without disturbing other env vars.
+            az containerapp secret set \
+              --name "$APP" --resource-group "$RG" \
+              --secrets "session-secret=$SESSION_SECRET" >/dev/null
             az containerapp update --no-wait \
-              --name "$APP" --resource-group "$RG" --image "$IMAGE"
+              --name "$APP" --resource-group "$RG" \
+              --image "$IMAGE" \
+              --set-env-vars "SESSION_SECRET=secretref:session-secret"
           else
             echo "→ Creating new Container App"
             az containerapp create --no-wait \
@@ -211,12 +228,14 @@ jobs:
               --user-assigned "$IDENT" \
               --registry-server "$ACR_LOGIN_SERVER" \
               --registry-identity "$IDENT" \
+              --secrets "session-secret=$SESSION_SECRET" \
               --env-vars \
                 AGENT_ID="$AGENT_ID" NODE_ENV=production PORT=3010 \
                 TENANT_SLUG="$SAFE_SLUG" \
                 TARGET_REGION="$REGION" \
                 TARGET_CLOUD=azure \
-                PLATFORM_KEYVAULT_URI="$KV_URI"
+                PLATFORM_KEYVAULT_URI="$KV_URI" \
+                SESSION_SECRET=secretref:session-secret
           fi
       - name: Wait for revision to become healthy
         env:

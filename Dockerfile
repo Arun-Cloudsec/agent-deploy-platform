@@ -1,5 +1,14 @@
 # ── Stage 1: Install dependencies ──────────────────────────────
-FROM node:20-alpine AS builder
+# Pin to alpine3.20 specifically — `node:20-alpine` is mutable and may lag
+# behind on patched OS packages. Re-pin to a newer release periodically
+# (the runtime-image-scan workflow will catch drift).
+FROM node:20-alpine3.20 AS builder
+
+# Apply OS-level security patches that may have shipped since the base
+# image was built. Cheap, deterministic, and prevents Trivy from flagging
+# already-patched-upstream CVEs.
+RUN apk update && apk upgrade --no-cache
+
 WORKDIR /app
 
 RUN apk add --no-cache python3 make g++
@@ -10,9 +19,10 @@ RUN npm ci --omit=dev
 COPY . .
 
 # ── Stage 2: Production runtime ────────────────────────────────
-FROM node:20-alpine AS production
+FROM node:20-alpine3.20 AS production
 
-RUN addgroup -g 1001 -S appgroup \
+RUN apk update && apk upgrade --no-cache \
+ && addgroup -g 1001 -S appgroup \
  && adduser  -u 1001 -S appuser -G appgroup \
  && apk add --no-cache dumb-init
 
@@ -21,7 +31,6 @@ WORKDIR /app
 COPY --from=builder --chown=appuser:appgroup /app/node_modules ./node_modules
 COPY --from=builder --chown=appuser:appgroup /app/package*.json ./
 COPY --from=builder --chown=appuser:appgroup /app/server.js     ./server.js
-COPY --from=builder --chown=appuser:appgroup /app/manage.js     ./manage.js
 COPY --from=builder --chown=appuser:appgroup /app/src           ./src
 COPY --from=builder --chown=appuser:appgroup /app/public        ./public
 

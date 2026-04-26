@@ -1,0 +1,271 @@
+# .github/workflows/runtime-image-scan.yml
+#
+# Weekly scan of all images actually running in production. Distinct from
+# `security.yml` which scans source code at PR time — this scans the
+# *immutable artifacts* that customers are touching right now.
+#
+# Why both? A CVE disclosed today against a package merged six months ago
+# won't show up in source-code PR scans (no PR triggers the scan). The
+# nightly `main` cron catches it but only tells you the source is now
+# vulnerable; nothing forces a rebuild of the running revision. This
+# workflow does the runtime check and creates an issue per finding so
+# someone has to acknowledge it.
+#
+# Required GitHub repo SECRETS:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID  (already set)
+#   AWS_DEPLOYER_ROLE_ARN                                     (vars, already set)
+#
+# Schedule: every Monday 06:00 UTC. The week-cadence is a deliberate choice
+# — daily would create alert fatigue; quarterly would let real issues
+# linger. Adjust the cron if your risk appetite differs.
+
+name: Runtime Image Scan
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'    # Mondays at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      severity-threshold:
+        description: 'Fail on this severity or higher'
+        type: choice
+        default: 'HIGH'
+        options: [CRITICAL, HIGH, MEDIUM]
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write           # to file findings as issues
+  id-token: write         # for OIDC federation to Azure + AWS
+
+concurrency:
+  group: runtime-image-scan
+  cancel-in-progress: false   # don't cancel a running scan with another scheduled trigger
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Discover every image currently running across all clouds and regions,
+  # then emit a JSON manifest the scan job consumes via matrix.
+  # ──────────────────────────────────────────────────────────────────────────
+  discover:
+    name: Discover live images
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.collect.outputs.images }}
+      count: ${{ steps.collect.outputs.count }}
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS credentials (OIDC, optional — only if AWS regions in use)
+        if: vars.AWS_DEPLOYER_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume:    ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region:        me-central-1
+          role-session-name: runtime-image-scan-${{ github.run_id }}
+
+      - name: Collect running images
+        id: collect
+        env:
+          AZURE_RESOURCE_GROUPS: 'ai-platform-rg,ai-platform-rg-uksouth'
+          AWS_REGIONS:           'me-central-1,me-south-1'
+        run: |
+          set -euo pipefail
+          # We build a JSON array of {name, image, source} objects. The matrix
+          # in the next job iterates over this. Empty arrays are fine — the
+          # next job just gets skipped.
+          MANIFEST="[]"
+
+          # ── Azure Container Apps ─────────────────────────────────────────
+          IFS=',' read -ra RGS <<< "$AZURE_RESOURCE_GROUPS"
+          for RG in "${RGS[@]}"; do
+            # Skip non-existent resource groups silently
+            if ! az group show -n "$RG" >/dev/null 2>&1; then
+              echo "::notice::Resource group $RG not found, skipping"
+              continue
+            fi
+            # List all Container Apps in the RG and their current images
+            APPS=$(az containerapp list -g "$RG" \
+              --query '[].{name:name, image:properties.template.containers[0].image}' \
+              -o json)
+            COUNT=$(echo "$APPS" | jq 'length')
+            echo "  $RG: $COUNT container apps"
+
+            # Annotate each with source=azure-<rg> for traceability
+            ANNOTATED=$(echo "$APPS" | jq --arg rg "$RG" \
+              '[.[] | . + {source: ("azure-" + $rg)}]')
+            MANIFEST=$(echo "$MANIFEST $ANNOTATED" | jq -s 'add')
+          done
+
+          # ── AWS App Runner (only if AWS_DEPLOYER_ROLE_ARN configured) ───
+          if [ -n "${AWS_DEPLOYER_ROLE_ARN:-}" ]; then
+            IFS=',' read -ra REGIONS <<< "$AWS_REGIONS"
+            for REGION in "${REGIONS[@]}"; do
+              # describe-services returns full configs; we want ServiceName + ImageIdentifier
+              # list-services first then loop with describe-service for each
+              SVCS=$(aws apprunner list-services --region "$REGION" \
+                --query 'ServiceSummaryList[?starts_with(ServiceName, `agentos-`)].ServiceArn' \
+                --output text 2>/dev/null || echo "")
+              if [ -z "$SVCS" ]; then continue; fi
+
+              for ARN in $SVCS; do
+                INFO=$(aws apprunner describe-service --region "$REGION" --service-arn "$ARN" \
+                  --query 'Service.{name:ServiceName, image:SourceConfiguration.ImageRepository.ImageIdentifier}' \
+                  -o json 2>/dev/null || echo '{}')
+                if [ "$(echo "$INFO" | jq -r '.image // empty')" = "" ]; then continue; fi
+                ENTRY=$(echo "$INFO" | jq --arg src "aws-$REGION" '. + {source: $src}')
+                MANIFEST=$(echo "[$ENTRY]" | jq -s --argjson m "$MANIFEST" '$m + .[0]')
+              done
+            done
+          fi
+
+          # GitHub Actions matrix needs compact single-line JSON
+          COMPACT=$(echo "$MANIFEST" | jq -c '.')
+          COUNT=$(echo "$MANIFEST" | jq 'length')
+          echo "Discovered $COUNT running images"
+          echo "$MANIFEST" | jq '.'
+          echo "images=$COMPACT" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Scan each discovered image individually.
+  # ──────────────────────────────────────────────────────────────────────────
+  scan:
+    name: Scan ${{ matrix.image.name }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    strategy:
+      fail-fast: false      # one bad scan shouldn't stop the rest
+      max-parallel: 5       # cap registry-pull concurrency
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      # Auth to whichever registry hosts this image. We detect by source prefix.
+      - name: Azure login (if Azure-sourced)
+        if: startsWith(matrix.image.source, 'azure-')
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login (if Azure-sourced)
+        if: startsWith(matrix.image.source, 'azure-')
+        run: |
+          # Image is like aiplatformacrkrz6di3sepgjo.azurecr.io/foo:tag
+          ACR_HOST=$(echo '${{ matrix.image.image }}' | cut -d/ -f1)
+          ACR_NAME=$(echo "$ACR_HOST" | cut -d. -f1)
+          az acr login --name "$ACR_NAME"
+
+      - name: AWS credentials + ECR login (if AWS-sourced)
+        if: startsWith(matrix.image.source, 'aws-')
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume:    ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region:        ${{ matrix.image.source == 'aws-me-central-1' && 'me-central-1' || 'me-south-1' }}
+          role-session-name: runtime-image-scan-${{ github.run_id }}
+
+      - name: ECR login (if AWS-sourced)
+        if: startsWith(matrix.image.source, 'aws-')
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # v0.24.0
+        with:
+          image-ref: ${{ matrix.image.image }}
+          format: sarif
+          output: trivy-runtime.sarif
+          severity: ${{ inputs.severity-threshold || 'CRITICAL,HIGH' }}
+          exit-code: '1'        # fail the matrix cell if findings exist
+          ignore-unfixed: true
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db
+
+      - name: Upload SARIF (categorized per image)
+        if: always()
+        uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          sarif_file: trivy-runtime.sarif
+          category: runtime-${{ matrix.image.source }}-${{ matrix.image.name }}
+
+      # On findings, file an issue so someone has to acknowledge.
+      # Issues are deduped by title — a re-run won't pile them up.
+      - name: File issue on findings
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const title = `🚨 Runtime image vulnerable: ${{ matrix.image.name }} (${{ matrix.image.source }})`;
+            const body = `Runtime image scan found High/Critical vulnerabilities in:
+
+            **Image:** \`${{ matrix.image.image }}\`
+            **Service:** ${{ matrix.image.name }}
+            **Source:** ${{ matrix.image.source }}
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Full SARIF in the [Security tab](${{ github.server_url }}/${{ github.repository }}/security/code-scanning?query=is%3Aopen+category%3Aruntime-${{ matrix.image.source }}-${{ matrix.image.name }}).
+
+            **To remediate:**
+            1. Review the SARIF findings (linked above)
+            2. Bump the affected dependency or base image in the source repo
+            3. Re-run the source-repo CI to rebuild
+            4. Trigger a fresh deploy from the marketplace
+            5. Close this issue once the new revision is running
+
+            Auto-generated by \`runtime-image-scan.yml\`.`;
+
+            // Dedupe by title — only create if no open issue with the same title
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security',
+            });
+            if (existing.data.some(i => i.title === title)) {
+              console.log(`Issue already open: ${title}`);
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title, body,
+              labels: ['security', 'runtime-scan'],
+            });
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Summary — runs always, even if some scans failed, to publish a digest
+  # comment to a tracking issue (or just log).
+  # ──────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Scan summary
+    needs: [discover, scan]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Print summary
+        env:
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          SCAN_RESULT:     ${{ needs.scan.result }}
+          IMAGE_COUNT:     ${{ needs.discover.outputs.count }}
+        run: |
+          echo "Runtime image scan complete:"
+          echo "  Images discovered: $IMAGE_COUNT"
+          echo "  Discover step:     $DISCOVER_RESULT"
+          echo "  Scan matrix:       $SCAN_RESULT"
+          if [ "$SCAN_RESULT" = "failure" ]; then
+            echo "::warning::One or more images had findings — check the Issues tab."
+          fi

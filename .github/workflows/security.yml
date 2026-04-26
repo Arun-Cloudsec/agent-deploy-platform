@@ -1,0 +1,348 @@
+# .github/workflows/security.yml
+#
+# AgentOS — Security CI pipeline.
+#
+# Runs seven scans in parallel on every PR and on a nightly schedule. Results
+# are uploaded as SARIF to the repo's Security tab for unified triage.
+#
+# Jobs:
+#   1. secrets-scan       — Gitleaks: catch committed API keys / passwords
+#   2. dependency-audit   — npm audit + Trivy fs: known-vulnerable npm packages
+#   3. container-scan     — Trivy on the built Docker image: base-image CVEs
+#   4. code-analysis      — CodeQL: actual code-level vulnerabilities (JS + Actions)
+#   5. iac-scan           — Checkov: CloudFormation misconfigurations
+#   6. actions-audit      — zizmor: script-injection + unsafe-action patterns
+#   7. sbom               — Syft: SBOM generation for procurement / compliance
+#
+# All third-party actions are pinned to commit SHAs (not tags) to protect
+# against supply-chain attacks where a malicious actor pushes to a tag they
+# control. To upgrade, look up the new SHA from the action's GitHub repo.
+
+name: Security CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  schedule:
+    # Nightly run at 02:00 UTC catches new CVEs in already-merged dependencies.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+# Each job declares only the permissions it needs. Read-only by default;
+# specific jobs request `security-events: write` to upload SARIF.
+permissions:
+  contents: read
+
+# Cancel superseded runs to save Actions minutes when developers push fast.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Secrets scanning — Gitleaks
+  # Catches committed API keys, AWS access keys, private keys, JWTs, etc.
+  # Runs on the full git history so it catches anything that ever existed,
+  # not just current HEAD.
+  # ──────────────────────────────────────────────────────────────────────────
+  secrets-scan:
+    name: Secrets — Gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+        with:
+          fetch-depth: 0    # gitleaks needs full history to scan past commits
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Personal license key not required for public repos; for private
+          # repos either get a free OSS license or use the alternative
+          # `gitleaks/gitleaks` Docker image directly.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Dependency audit — npm audit + Trivy filesystem scan
+  # npm audit catches what's in the npm advisory database; Trivy catches
+  # what's in many other databases (GitHub Advisory, OSV, etc.) plus
+  # transitive vulns. Running both is belt-and-braces.
+  # ──────────────────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: Dependencies — npm audit + Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Setup Node
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b  # v4.0.3
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (lockfile-faithful)
+        run: npm ci --ignore-scripts
+
+      - name: npm audit (high+critical fail the build)
+        run: |
+          set -euo pipefail
+          # --audit-level=high blocks on high or critical only; moderate/low
+          # are reported in the JSON output but don't fail the job. Adjust
+          # if your risk appetite differs.
+          npm audit --audit-level=high --json > npm-audit.json || AUDIT_EXIT=$?
+          AUDIT_EXIT=${AUDIT_EXIT:-0}
+          # Print a summary regardless of pass/fail
+          jq -r '.metadata.vulnerabilities | to_entries | .[] | "  \(.key): \(.value)"' npm-audit.json || cat npm-audit.json
+          exit $AUDIT_EXIT
+
+      - name: Trivy filesystem scan (uploads SARIF)
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # v0.24.0
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+        env:
+          # TRIVY_DB_REPOSITORY mirrors the DB to GHCR which has higher rate
+          # limits than Docker Hub — avoids 429s during CI bursts.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. Container image scan — build the Dockerfile and scan the image
+  # Catches CVEs in the base image (node:20-alpine etc.) and in the
+  # final layered image. Runs after build so Trivy sees the actual layers
+  # that ship to production, not just declared dependencies.
+  # ──────────────────────────────────────────────────────────────────────────
+  container-scan:
+    name: Container — Trivy image scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db  # v3.6.1
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@5cd11c3a4ced054e52742c5fd54dca954e0edd85  # v6.7.0
+        with:
+          context: .
+          push: false
+          tags: agentos:scan
+          load: true
+          # Pass --provenance=false to avoid Trivy choking on attestation manifests
+          provenance: false
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # v0.24.0
+        with:
+          image-ref: agentos:scan
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. Static code analysis — CodeQL
+  # GitHub-native, deep semantic analysis. Catches things grep can't —
+  # taint flow from inputs to sinks, prototype pollution, regex DoS, etc.
+  # Free for public repos; included with GitHub Advanced Security otherwise.
+  # ──────────────────────────────────────────────────────────────────────────
+  code-analysis:
+    name: Code — CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript-typescript', 'actions']
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          category: '/language:${{ matrix.language }}'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 5. IaC scanning — Checkov on CloudFormation
+  # Catches misconfigurations: unencrypted S3 buckets, public RDS, missing
+  # KMS keys, overly permissive IAM, etc. Some false positives but worth it.
+  # ──────────────────────────────────────────────────────────────────────────
+  iac-scan:
+    name: IaC — Checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Run Checkov on CloudFormation
+        uses: bridgecrewio/checkov-action@38a95e98d734de90ac15e6427aaa971afa676a4f  # v12.2911.0
+        with:
+          file: aws-foundation.yaml
+          framework: cloudformation
+          output_format: sarif
+          output_file_path: checkov.sarif
+          # Skip checks that don't apply to our risk model:
+          #   CKV_AWS_8   — RDS encryption: we use the default KMS key already
+          #   CKV_AWS_157 — RDS Multi-AZ: we deliberately use single-AZ for cost
+          #   CKV_AWS_117 — Lambda VPC: we don't use Lambda
+          skip_check: 'CKV_AWS_8,CKV_AWS_157,CKV_AWS_117'
+          soft_fail: false
+
+      - name: Upload Checkov SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          sarif_file: checkov.sarif/results_sarif.sarif
+          category: checkov
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 6. GitHub Actions audit — zizmor
+  # Specifically catches the patterns that bit us in v6.9 → v6.10:
+  #   - ${{ inputs.* }} interpolation directly in shell (script injection)
+  #   - Action references pinned to mutable tags instead of SHAs
+  #   - Excessive permissions
+  #   - Missing concurrency / timeout
+  # zizmor is the right tool for Actions-specific vulns; CodeQL Actions
+  # support is newer and less mature.
+  # ──────────────────────────────────────────────────────────────────────────
+  actions-audit:
+    name: Actions — zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Install zizmor
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/woodruffw/zizmor/releases/download/v0.6.0/zizmor-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz
+          sudo mv zizmor /usr/local/bin/
+
+      - name: Run zizmor
+        run: |
+          set -euo pipefail
+          # --format sarif outputs to stdout; redirect to file
+          zizmor --format sarif .github/workflows/ > zizmor.sarif || ZIZMOR_EXIT=$?
+          ZIZMOR_EXIT=${ZIZMOR_EXIT:-0}
+          # Show human summary for the PR check log
+          zizmor .github/workflows/ || true
+          # Exit with whatever zizmor returned (non-zero on findings)
+          exit $ZIZMOR_EXIT
+
+      - name: Upload zizmor SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.0
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 7. SBOM generation — Syft
+  # Produces a software bill of materials in SPDX + CycloneDX formats.
+  # Doesn't find vulns itself; pairs with Trivy for "what we ship + what's
+  # broken in it" coverage. Increasingly required in enterprise procurement.
+  # ──────────────────────────────────────────────────────────────────────────
+  sbom:
+    name: SBOM — Syft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332  # v4.1.7
+
+      - name: Generate SBOM (SPDX-JSON)
+        uses: anchore/sbom-action@e8d2a6937ecead383dfe75190d104edd1f9c5751  # v0.16.1
+        with:
+          path: '.'
+          format: spdx-json
+          artifact-name: agentos-sbom.spdx.json
+          output-file: agentos-sbom.spdx.json
+
+      - name: Generate SBOM (CycloneDX-JSON)
+        uses: anchore/sbom-action@e8d2a6937ecead383dfe75190d104edd1f9c5751  # v0.16.1
+        with:
+          path: '.'
+          format: cyclonedx-json
+          artifact-name: agentos-sbom.cdx.json
+          output-file: agentos-sbom.cdx.json
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Summary job — gates the PR. Fails if any prior job failed.
+  # Branch protection should require this single check rather than each
+  # scan individually; cleaner UX and easier to update the matrix later.
+  # ──────────────────────────────────────────────────────────────────────────
+  security-gate:
+    name: Security gate
+    runs-on: ubuntu-latest
+    needs:
+      - secrets-scan
+      - dependency-audit
+      - container-scan
+      - code-analysis
+      - iac-scan
+      - actions-audit
+      - sbom
+    if: always()
+    steps:
+      - name: Check all scans passed
+        env:
+          RESULTS: ${{ toJson(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq -r 'to_entries | .[] | "\(.key): \(.value.result)"'
+          # Fail the gate if any prerequisite job failed or was cancelled.
+          # 'skipped' is allowed (e.g. if the matrix is filtered).
+          FAILED=$(echo "$RESULTS" | jq -r 'to_entries | .[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')
+          if [ -n "$FAILED" ]; then
+            echo "::error::Security gate failed. Failed jobs:"
+            echo "$FAILED"
+            exit 1
+          fi
+          echo "All security scans passed."

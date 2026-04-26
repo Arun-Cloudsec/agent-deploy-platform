@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AgentOS — AWS regional foundation. Deploys the standing infrastructure that
+  every agent plugs into: VPC, ECR, RDS Postgres, ElastiCache Redis, Secrets
+  Manager, App Runner IAM roles, and the GitHub Actions OIDC trust role.
+
+  Apply once per AWS region you want to enable (recommended: me-central-1
+  for UAE residency, me-south-1 for Bahrain).
+
+  Total foundation cost: ~$35/month at idle (db.t4g.micro RDS + cache.t4g.micro
+  ElastiCache + small CloudWatch + ~zero ECR storage).
+
+  Per-agent cost: each App Runner service adds ~$5-50/month depending on
+  traffic; scales to zero on idle.
+
+# ──────────────────────────────────────────────────────────────────────────
+Parameters:
+# ──────────────────────────────────────────────────────────────────────────
+  GitHubOrg:
+    Type: String
+    Default: Arun-Cloudsec
+    Description: GitHub org/owner that runs the deploy workflow.
+  GitHubRepo:
+    Type: String
+    Default: agent-deploy-platform
+    Description: GitHub repository name.
+  AllowedBranches:
+    Type: String
+    Default: 'main,master'
+    Description: Comma-separated branches the OIDC role can deploy from.
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Master password for the RDS Postgres instance. Store in a password manager.
+  EnableRDS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to provision RDS. Set false for the cheapest demo setup.
+
+# ──────────────────────────────────────────────────────────────────────────
+Conditions:
+# ──────────────────────────────────────────────────────────────────────────
+  CreateRDS: !Equals [!Ref EnableRDS, 'true']
+
+# ──────────────────────────────────────────────────────────────────────────
+Resources:
+# ──────────────────────────────────────────────────────────────────────────
+
+  # ─── Networking — VPC with 2 private + 2 public subnets across 2 AZs ────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: agentos-vpc }
+        - { Key: Project, Value: AgentOS }
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: agentos-igw }]
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref IGW }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: agentos-public-a }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: agentos-public-b }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: agentos-private-a }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: agentos-private-b }]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: agentos-public-rt }]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicRTAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRT }
+
+  PublicRTAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRT }
+
+  # ─── Security group for RDS + ElastiCache (private only) ─────────────────
+  PrivateSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgentOS private services (RDS, Redis) — App Runner egress only
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: agentos-private-sg }]
+
+  # ─── ECR Repository ──────────────────────────────────────────────────────
+  ECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: agentos/rfp-agent
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 20 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: AgentOS }
+
+  # ─── GitHub OIDC provider — one per AWS account, idempotent ──────────────
+  # AWS validates GitHub Actions tokens via the well-known JWKS endpoint;
+  # ThumbprintList is no longer required for token.actions.githubusercontent.com.
+  # We pass a placeholder thumbprint that AWS accepts but does not enforce —
+  # this avoids silent breakage when GitHub rotates its certificate (which
+  # used to invalidate any role using a hardcoded thumbprint).
+  # Note: if you already have a GitHub OIDC provider in this account, comment
+  # this out and import the existing one — only one provider per URL is allowed.
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - ffffffffffffffffffffffffffffffffffffffff
+
+  # ─── IAM role assumed by GitHub Actions to deploy ────────────────────────
+  GitHubDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentOS-GitHub-Deployer
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  Fn::Split:
+                    - ','
+                    - !Sub
+                      - 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${Branches}'
+                      - Branches: !Join
+                          - ',repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/'
+                          - !Split [',', !Ref AllowedBranches]
+      Policies:
+        - PolicyName: ECRPushPullAndAppRunnerDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR auth — must be * (no resource-level support)
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              # ECR push/pull — scoped to agentos/* repositories only
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/agentos/*'
+              # App Runner — list/describe must be * (no resource-level support
+              # for these), but mutating actions are scoped to agentos-* services.
+              - Effect: Allow
+                Action:
+                  - apprunner:DescribeService
+                  - apprunner:ListServices
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - apprunner:CreateService
+                  - apprunner:UpdateService
+                  - apprunner:DeleteService
+                  - apprunner:TagResource
+                Resource: !Sub 'arn:aws:apprunner:${AWS::Region}:${AWS::AccountId}:service/agentos-*'
+              # PassRole — only the App Runner instance role, only to App Runner
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt AppRunnerInstanceRole.Arn
+                  - !GetAtt AppRunnerAccessRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - apprunner.amazonaws.com
+                      - tasks.apprunner.amazonaws.com
+                      - build.apprunner.amazonaws.com
+
+  # ─── IAM role App Runner uses to pull from ECR ────────────────────────────
+  AppRunnerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentOS-AppRunner-AccessRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: build.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  # ─── IAM role App Runner instance assumes at runtime ─────────────────────
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentOS-AppRunner-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: tasks.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:agentos/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ─── RDS Postgres (optional, gated by EnableRDS) ─────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: CreateRDS
+    Properties:
+      DBSubnetGroupDescription: AgentOS RDS subnet group (private)
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateRDS
+    Properties:
+      DBInstanceIdentifier: agentos-postgres
+      Engine: postgres
+      EngineVersion: '16.1'
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MasterUsername: agentos
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref PrivateSG]
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      PubliclyAccessible: false
+      MultiAZ: false
+      Tags: [{ Key: Project, Value: AgentOS }]
+
+  # ─── ElastiCache Redis (single-node t4g.micro) ───────────────────────────
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: AgentOS Redis subnet group
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: agentos-redis
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: cache.t4g.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds: [!GetAtt PrivateSG.GroupId]
+      Tags: [{ Key: Project, Value: AgentOS }]
+
+# ──────────────────────────────────────────────────────────────────────────
+Outputs:
+# ──────────────────────────────────────────────────────────────────────────
+  ECRRegistryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+    Description: ECR registry URI for this region
+    Export: { Name: !Sub '${AWS::StackName}-ECRRegistry' }
+
+  ECRRepoName:
+    Value: !Ref ECRRepo
+    Description: ECR repository name
+
+  GitHubDeployerRoleArn:
+    Value: !GetAtt GitHubDeployerRole.Arn
+    Description: |
+      Set this as GitHub repo variable AWS_DEPLOYER_ROLE_ARN.
+      The deploy workflow uses it to push to ECR and update App Runner.
+    Export: { Name: !Sub '${AWS::StackName}-DeployerRoleArn' }
+
+  AppRunnerAccessRoleArn:
+    Value: !GetAtt AppRunnerAccessRole.Arn
+    Description: |
+      Set this as GitHub repo variable AWS_APPRUNNER_ACCESS_ROLE_ARN.
+      App Runner uses this to pull images from ECR.
+
+  AppRunnerInstanceRoleArn:
+    Value: !GetAtt AppRunnerInstanceRole.Arn
+    Description: |
+      Set this as GitHub repo variable AWS_APPRUNNER_ROLE_ARN.
+      Runtime role for App Runner instances — reads Secrets Manager,
+      writes CloudWatch logs.
+
+  PostgresEndpoint:
+    Value: !If [CreateRDS, !GetAtt RDSInstance.Endpoint.Address, 'not-deployed']
+    Description: Postgres connection endpoint (if RDS enabled)
+
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Description: Redis connection endpoint

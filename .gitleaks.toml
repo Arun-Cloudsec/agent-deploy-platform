@@ -1,0 +1,36 @@
+# .gitleaks.toml — Gitleaks configuration for AgentOS
+#
+# Inherits all default rules. The [allowlist] block excludes known false
+# positives — patterns Gitleaks correctly identifies as secret-shaped
+# but that we intentionally check in (demo bcrypt hashes, placeholder
+# thumbprints, etc.).
+#
+# Each entry MUST include a comment explaining why and (where applicable)
+# a date or PR for re-review.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented false positives — AgentOS"
+
+# Bcrypt hash of "demo123" used for the seed admin/viewer accounts. This is
+# intentionally checked in as the demo-credential default; production
+# deployments override via the USERS array or by federating to Keycloak.
+# Reviewed: v6.10 security audit, 2026-04.
+regexes = [
+    '''\$2[aby]\$10\$IYXa\.aGBI/CiTjyRD4f6v\.hfuyf6ygYzqY4yVgOy8JGUDBYIleM1y''',
+    # Placeholder OIDC thumbprint in aws-foundation.yaml — AWS no longer
+    # validates these for token.actions.githubusercontent.com (uses JWKS
+    # instead), but the field is required by the API.
+    '''ffffffffffffffffffffffffffffffffffffffff''',
+]
+
+paths = [
+    # SBOM artifacts can contain hash-shaped strings that look like secrets
+    '''.*\.sbom\.json''',
+    '''.*\.spdx\.json''',
+    '''.*\.cdx\.json''',
+    # Lock files contain integrity hashes
+    '''package-lock\.json''',
+]

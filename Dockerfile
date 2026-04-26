@@ -24,7 +24,19 @@ FROM node:20-alpine3.20 AS production
 RUN apk update && apk upgrade --no-cache \
  && addgroup -g 1001 -S appgroup \
  && adduser  -u 1001 -S appuser -G appgroup \
- && apk add --no-cache dumb-init
+ && apk add --no-cache dumb-init \
+ # Remove npm + corepack from the production image. We don't invoke npm at
+ # runtime (CMD is `node server.js`), and Node 20's bundled npm carries a
+ # number of HIGH-severity vulns in its own transitive deps (cross-spawn,
+ # glob, minimatch, tar — see Trivy scan). Deleting them eliminates all 11
+ # findings without affecting runtime behavior. The builder stage still has
+ # npm available for the `npm ci` step.
+ && rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+           /usr/local/bin/corepack \
+           /opt/yarn-*
 
 WORKDIR /app
 

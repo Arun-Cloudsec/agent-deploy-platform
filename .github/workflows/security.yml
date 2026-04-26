@@ -1,0 +1,34 @@
+# .github/workflows/security.yml
+#
+# Drop-in wrapper that delegates to the org-canonical security pipeline.
+# To change scanners / SHAs / ignore rules, edit
+# `Arun-Cloudsec/.github/.github/workflows/reusable-security.yml` instead —
+# every consumer of this wrapper inherits the change automatically.
+#
+# This template is for JavaScript / Node.js agents with a Dockerfile.
+# For Python / Go / no-container variants, see the templates in
+# `Arun-Cloudsec/.github`.
+
+name: Security CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  security:
+    uses: Arun-Cloudsec/.github/.github/workflows/reusable-security.yml@main
+    with:
+      language: javascript
+      scan-container: true
+    secrets: inherit

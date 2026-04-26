@@ -1,0 +1,3678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentOS — Multi-region AI agent deployment platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Source+Serif+4:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* McKinsey-inspired: pure white, deep navy, elegant serif headlines */
+  :root {
+    --white: #ffffff;
+    --bg-0: #ffffff;
+    --bg-1: #f6f6f6;
+    --bg-2: #ebebeb;
+    --bg-3: #e0e0e0;
+    --line: #d6d6d6;
+    --line-2: #a8a8a8;
+
+    --navy: #051c2c;
+    --navy-2: #034b6f;
+    --text-0: #051c2c;
+    --text-1: #424b56;
+    --text-2: #767676;
+
+    --accent: #2251ff;       /* McKinsey blue */
+    --accent-soft: rgba(34, 81, 255, 0.08);
+    --accent-2: #034b6f;
+    --good: #00a5a8;
+    --good-soft: rgba(0, 165, 168, 0.08);
+    --warn: #ffa800;
+    --warn-soft: rgba(255, 168, 0, 0.10);
+    --bad: #e0301e;
+    --bad-soft: rgba(224, 48, 30, 0.08);
+
+    --shadow-card: 0 1px 3px rgba(5, 28, 44, 0.06);
+    --shadow-card-h: 0 8px 24px rgba(5, 28, 44, 0.08);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: var(--bg-0);
+    color: var(--text-0);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+    font-feature-settings: 'ss01', 'ss03';
+  }
+  .serif { font-family: 'Source Serif 4', Georgia, serif; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  #app { min-height: 100vh; }
+
+  /* ─── Login ─── */
+  .login-page {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+  }
+  @media (max-width: 900px) {
+    .login-page { grid-template-columns: 1fr; }
+    .login-page .splash { display: none; }
+  }
+  .splash {
+    background: var(--navy);
+    color: white;
+    padding: 80px 60px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: relative;
+    overflow: hidden;
+  }
+  .splash::before {
+    content: '';
+    position: absolute;
+    top: -20%; right: -10%;
+    width: 600px; height: 600px;
+    background: radial-gradient(circle, rgba(34, 81, 255, 0.20) 0%, transparent 60%);
+    pointer-events: none;
+  }
+  .splash-mark {
+    width: 56px; height: 56px;
+    background: white;
+    color: var(--navy);
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+    font-size: 22px;
+    letter-spacing: -0.04em;
+    position: relative;
+  }
+  .splash-headline {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 64px;
+    font-weight: 400;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    margin-bottom: 32px;
+    position: relative;
+  }
+  .splash-headline em {
+    font-style: italic;
+    color: rgba(255, 255, 255, 0.85);
+  }
+  .splash-sub {
+    font-size: 18px;
+    color: rgba(255, 255, 255, 0.72);
+    max-width: 520px;
+    line-height: 1.6;
+    position: relative;
+  }
+  .splash-foot {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    position: relative;
+  }
+
+  .login-card {
+    padding: 80px 60px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background: white;
+  }
+  .login-card-inner { width: 100%; max-width: 400px; }
+  .login-card h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 32px;
+    font-weight: 500;
+    margin-bottom: 8px;
+    letter-spacing: -0.02em;
+  }
+  .login-card .desc { color: var(--text-1); margin-bottom: 36px; font-size: 15px; }
+  .form-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 20px; }
+  .form-row label { font-size: 12px; color: var(--text-2); font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+  .form-row input {
+    padding: 12px 14px; background: white; border: 1px solid var(--line); border-radius: 0;
+    color: var(--text-0); font: inherit; font-size: 15px;
+    transition: border-color 0.15s;
+  }
+  .form-row input:focus { outline: none; border-color: var(--accent); }
+  .btn { border: none; cursor: pointer; font: inherit; transition: all 0.15s; }
+  .btn-primary {
+    width: 100%;
+    padding: 14px 16px;
+    border-radius: 0;
+    background: var(--navy);
+    color: white;
+    font-weight: 500;
+    font-size: 15px;
+    margin-top: 8px;
+    letter-spacing: 0.01em;
+  }
+  .btn-primary:hover { background: var(--accent); }
+  .azure-btn {
+    width: 100%;
+    padding: 12px 16px;
+    border-radius: 0;
+    background: white;
+    border: 1px solid var(--line);
+    color: var(--text-0);
+    font-weight: 500;
+    font-size: 14px;
+    margin-top: 12px;
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+  }
+  .azure-btn:hover { border-color: var(--navy); background: var(--bg-1); }
+  .demo-hint {
+    margin-top: 28px;
+    padding: 14px 16px;
+    background: var(--bg-1);
+    border-left: 2px solid var(--accent);
+    font-size: 13px;
+    color: var(--text-1);
+    line-height: 1.6;
+  }
+  .demo-hint code { background: white; padding: 2px 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--navy); }
+  .login-error {
+    margin-top: 12px; padding: 12px 14px;
+    background: var(--bad-soft); color: var(--bad); font-size: 13px;
+    border-left: 2px solid var(--bad);
+  }
+
+  /* ─── Top nav ─── */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    background: white;
+    border-bottom: 1px solid var(--line);
+    padding: 0 40px;
+    height: 64px;
+    display: flex; align-items: center; gap: 32px;
+  }
+  .topbar-mark {
+    width: 36px; height: 36px;
+    background: var(--navy);
+    color: white;
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: -0.02em;
+    flex-shrink: 0;
+  }
+  .topbar-name {
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: -0.02em;
+    color: var(--navy);
+  }
+  .topbar-name span { font-weight: 400; color: var(--text-2); margin-left: 8px; font-size: 13px; }
+  .nav { display: flex; gap: 0; margin-left: 24px; }
+  .nav-item {
+    padding: 22px 16px;
+    color: var(--text-1);
+    font-size: 14px;
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font: inherit;
+    transition: all 0.15s;
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: -1px;
+  }
+  .nav-item:hover { color: var(--navy); }
+  .nav-item.active { color: var(--navy); border-bottom-color: var(--accent); font-weight: 500; }
+  .nav-badge {
+    background: var(--accent); color: white;
+    font-size: 11px; font-weight: 600;
+    padding: 1px 7px; border-radius: 10px; min-width: 18px; text-align: center;
+  }
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .topbar-region { font-size: 12px; color: var(--text-2); padding: 6px 12px; background: var(--bg-1); border-radius: 14px; }
+  .topbar-user { display: flex; align-items: center; gap: 10px; }
+  .avatar {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: var(--navy); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 600; font-size: 13px;
+  }
+  .user-name { font-size: 14px; color: var(--text-0); }
+  .signout-link { color: var(--text-2); font-size: 13px; cursor: pointer; }
+  .signout-link:hover { color: var(--navy); }
+
+  /* ─── Page header ─── */
+  .page-wrapper { max-width: 1400px; margin: 0 auto; padding: 56px 40px 80px; }
+  .page-eyebrow {
+    color: var(--accent); font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    font-weight: 500;
+    margin-bottom: 16px;
+  }
+  .page-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 56px; font-weight: 400;
+    letter-spacing: -0.02em; line-height: 1.05;
+    margin-bottom: 20px; max-width: 900px;
+    color: var(--navy);
+  }
+  .page-title em { font-style: italic; color: var(--accent); }
+  .page-sub {
+    color: var(--text-1);
+    font-size: 17px; max-width: 680px; line-height: 1.55;
+  }
+  .page-divider {
+    height: 1px;
+    background: var(--line);
+    margin: 56px 0 40px;
+  }
+
+  /* ─── Voice tour strip (marketplace top) ─── */
+  .voice-tour {
+    margin-top: 28px;
+    padding: 18px 22px;
+    background: linear-gradient(135deg, var(--navy) 0%, #1e3a8a 100%);
+    border-radius: 12px;
+    color: white;
+    display: grid;
+    grid-template-columns: 44px 1fr auto auto;
+    gap: 16px;
+    align-items: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .voice-tour::before {
+    content: ''; position: absolute;
+    top: -40%; right: -10%;
+    width: 280px; height: 280px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.25) 0%, transparent 65%);
+    pointer-events: none;
+  }
+  @media (max-width: 720px) {
+    .voice-tour { grid-template-columns: 44px 1fr; gap: 12px; padding: 16px; }
+    .voice-tour-controls { grid-column: 1 / -1; display: flex; gap: 8px; flex-wrap: wrap; }
+  }
+  .voice-tour-icon {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #8b5cf6, #06b6d4);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+    position: relative; z-index: 1;
+  }
+  .voice-tour-text {
+    position: relative; z-index: 1;
+    min-width: 0;
+  }
+  .voice-tour-eyebrow {
+    font-size: 10px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.65);
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    margin-bottom: 3px;
+  }
+  .voice-tour-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 17px;
+    font-weight: 500;
+    color: white;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+  }
+  .voice-tour-controls {
+    display: flex; gap: 8px; align-items: center;
+    position: relative; z-index: 1;
+  }
+  .voice-lang-select {
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, 0.20);
+    color: white;
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 6px;
+    outline: none;
+  }
+  .voice-lang-select option { color: var(--text-0); background: white; }
+  .voice-play-btn {
+    padding: 9px 18px;
+    background: white;
+    color: var(--navy);
+    border: none;
+    border-radius: 6px;
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: transform 0.15s, background 0.15s;
+  }
+  .voice-play-btn:hover { transform: translateY(-1px); background: var(--accent-soft); color: var(--accent); }
+  .voice-play-btn:disabled { opacity: 0.7; cursor: wait; transform: none; background: white; color: var(--navy); }
+  .voice-play-btn .dots {
+    display: inline-flex; gap: 2px;
+  }
+  .voice-play-btn .dots span {
+    width: 4px; height: 4px; border-radius: 50%;
+    background: currentColor;
+    animation: voice-dot 1.2s infinite;
+  }
+  .voice-play-btn .dots span:nth-child(2) { animation-delay: 0.15s; }
+  .voice-play-btn .dots span:nth-child(3) { animation-delay: 0.30s; }
+  @keyframes voice-dot {
+    0%, 60%, 100% { opacity: 0.4; }
+    30% { opacity: 1; }
+  }
+  .voice-audio-wrap {
+    grid-column: 1 / -1;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid rgba(255, 255, 255, 0.15);
+    position: relative; z-index: 1;
+  }
+  .voice-audio-wrap audio {
+    width: 100%; height: 36px;
+    border-radius: 6px;
+  }
+  .voice-tour-error {
+    grid-column: 1 / -1;
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(255, 100, 100, 0.15);
+    border-left: 3px solid #ff8a8a;
+    font-size: 12.5px;
+    color: rgba(255, 255, 255, 0.90);
+    line-height: 1.5;
+    border-radius: 0 4px 4px 0;
+    position: relative; z-index: 1;
+  }
+
+  /* ─── Filters ─── */
+  .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 32px; }
+  .search-box {
+    flex: 1; min-width: 280px;
+    padding: 11px 14px;
+    background: white; border: 1px solid var(--line); border-radius: 0;
+    color: var(--text-0); font: inherit; font-size: 14px;
+  }
+  .search-box:focus { outline: none; border-color: var(--accent); }
+  .pills { display: flex; gap: 0; flex-wrap: wrap; border: 1px solid var(--line); }
+  .pill {
+    padding: 8px 16px;
+    border: none; border-right: 1px solid var(--line);
+    background: white; color: var(--text-1);
+    font-size: 13px; cursor: pointer; transition: all 0.15s;
+    font: inherit;
+  }
+  .pill:last-child { border-right: none; }
+  .pill:hover { background: var(--bg-1); color: var(--navy); }
+  .pill.active { background: var(--navy); color: white; }
+
+  /* ─── Cards (catalog) ─── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 24px;
+  }
+  .card {
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 28px;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: card-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation-delay: calc(var(--i) * 25ms);
+    min-height: 280px;
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+  @keyframes card-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .card:hover { box-shadow: var(--shadow-card-h); border-color: var(--line-2); }
+  .card-icon { font-size: 32px; line-height: 1; color: var(--card-color); margin-bottom: 16px; }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+  .card-badge {
+    font-size: 10px; font-weight: 600; color: var(--card-color);
+    text-transform: uppercase; letter-spacing: 0.10em;
+  }
+  .card-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.08em; }
+  .card-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .card-status.coming-soon .dot { background: var(--text-2); }
+  .card h3 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 22px; font-weight: 500;
+    letter-spacing: -0.01em; margin-bottom: 10px;
+    color: var(--navy);
+  }
+  .card-desc { color: var(--text-1); font-size: 14px; line-height: 1.55; flex: 1; margin-bottom: 16px; }
+  .card-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; }
+  .card-tag { font-size: 11px; color: var(--text-2); background: var(--bg-1); padding: 3px 8px; }
+  .card-actions { display: flex; gap: 8px; }
+  .card-cta {
+    flex: 1; padding: 10px 14px;
+    border-radius: 0; font-size: 13px; font-weight: 500;
+    text-align: center; cursor: pointer; transition: all 0.15s;
+    border: 1px solid var(--line); background: white; color: var(--text-0);
+    text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 6px;
+    font: inherit;
+  }
+  .card-cta:hover { border-color: var(--navy); background: var(--bg-1); }
+  .card-cta.primary {
+    background: var(--navy); color: white; border-color: var(--navy);
+    font-weight: 500;
+  }
+  .card-cta.primary:hover { background: var(--accent); border-color: var(--accent); }
+  .card-cta.disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+
+  /* ─── Stat cards (dashboard) ─── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    margin-bottom: 40px;
+  }
+  .stat-card {
+    background: white;
+    padding: 28px 24px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .stat-lbl {
+    font-size: 12px; color: var(--text-2);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    font-weight: 500;
+  }
+  .stat-val {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 44px; font-weight: 500; letter-spacing: -0.03em;
+    line-height: 1;
+    color: var(--navy);
+  }
+  .stat-val .unit { font-size: 18px; color: var(--text-2); margin-left: 4px; font-weight: 400; }
+  .stat-change { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 4px; }
+  .stat-change.up { color: var(--good); }
+  .stat-change.down { color: var(--bad); }
+  .stat-source { font-size: 10px; color: var(--text-2); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+
+  /* ─── Tables ─── */
+  .data-table-wrap { background: white; border: 1px solid var(--line); }
+  .table-head {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .table-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 22px; font-weight: 500;
+    color: var(--navy); letter-spacing: -0.01em;
+  }
+  .data-table { width: 100%; border-collapse: collapse; }
+  .data-table th {
+    text-align: left;
+    padding: 14px 24px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--text-2);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  .data-table td {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+    color: var(--text-0);
+    vertical-align: middle;
+  }
+  .data-table tr:last-child td { border-bottom: none; }
+  .data-table tr:hover td { background: var(--bg-1); }
+
+  .agent-cell { display: flex; align-items: center; gap: 10px; }
+  .agent-cell .icon {
+    font-size: 18px; width: 36px; height: 36px;
+    background: var(--bg-1); border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .region-badge-cell {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    background: var(--bg-1);
+    font-size: 12px; color: var(--text-1);
+  }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; font-size: 12px; font-weight: 500;
+    background: var(--good-soft); color: var(--good);
+  }
+  .status-pill.demo { background: var(--warn-soft); color: var(--warn); }
+  .status-pill.stopped { background: var(--bg-2); color: var(--text-2); }
+
+  .url-cell { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-1); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-actions { display: flex; gap: 6px; }
+  .row-btn {
+    padding: 6px 12px;
+    background: white; border: 1px solid var(--line);
+    color: var(--text-0); cursor: pointer;
+    font: inherit; font-size: 12px; text-decoration: none;
+  }
+  .row-btn:hover { border-color: var(--navy); background: var(--bg-1); }
+  .row-btn.danger { color: var(--bad); border-color: var(--bad-soft); }
+  .row-btn.danger:hover { background: var(--bad-soft); border-color: var(--bad); }
+
+  .empty-state { text-align: center; padding: 80px 32px; color: var(--text-2); }
+  .empty-state h3 { font-family: 'Source Serif 4', Georgia, serif; font-size: 22px; color: var(--text-1); margin-bottom: 8px; }
+
+  /* ─── Modal ─── */
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(5, 28, 44, 0.50);
+    z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+    animation: fade-in 0.2s ease-out;
+  }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  .modal {
+    position: relative;
+    background: white; border-radius: 0;
+    width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto;
+    padding: 40px;
+    animation: slide-up 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 32px 80px rgba(5, 28, 44, 0.30);
+  }
+  @keyframes slide-up { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+  .modal-close {
+    position: absolute; top: 16px; right: 16px;
+    width: 32px; height: 32px;
+    background: white; border: 1px solid var(--line);
+    color: var(--text-1); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  .modal-close:hover { border-color: var(--navy); }
+  .modal h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 28px; font-weight: 500;
+    letter-spacing: -0.02em; margin-bottom: 8px; padding-right: 40px;
+    color: var(--navy);
+  }
+  .modal-sub { color: var(--text-1); margin-bottom: 28px; font-size: 14px; line-height: 1.5; }
+  .modal-step-label { font-size: 11px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 14px; margin-top: 8px; font-weight: 600; }
+
+  .target-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 16px; }
+  .target-card {
+    padding: 16px;
+    border: 1px solid var(--line);
+    background: white; cursor: pointer;
+    transition: all 0.15s;
+    text-align: left; color: var(--text-0); font: inherit;
+  }
+  .target-card:hover { border-color: var(--navy); background: var(--bg-1); }
+  .target-card.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .target-card.disabled { opacity: 0.45; cursor: not-allowed; }
+  .target-name { font-weight: 600; font-size: 14px; margin-bottom: 4px; color: var(--navy); }
+  .target-desc { font-size: 12px; color: var(--text-2); }
+
+  .region-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+  .region-card {
+    padding: 16px;
+    border: 1px solid var(--line);
+    background: white; cursor: pointer;
+    transition: all 0.15s;
+    display: flex; align-items: center; gap: 14px;
+    text-align: left; color: var(--text-0); font: inherit; width: 100%;
+  }
+  .region-card:hover { border-color: var(--navy); background: var(--bg-1); }
+  .region-card.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .region-flag { font-size: 28px; line-height: 1; }
+  .region-info { flex: 1; }
+  .region-name { font-weight: 600; font-size: 14px; margin-bottom: 3px; color: var(--navy); }
+  .region-desc { font-size: 12px; color: var(--text-2); }
+  .region-radio {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--line-2); flex-shrink: 0;
+  }
+  .region-card.selected .region-radio {
+    border-color: var(--accent); background: var(--accent);
+    box-shadow: inset 0 0 0 3px white;
+  }
+
+  .modal-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--line); }
+  .modal-back {
+    padding: 10px 18px;
+    background: white; border: 1px solid var(--line);
+    color: var(--text-1); cursor: pointer;
+    font: inherit; font-size: 14px;
+  }
+  .modal-back:hover { border-color: var(--navy); color: var(--navy); }
+  .modal-deploy {
+    padding: 10px 22px;
+    background: var(--navy); color: white; border: none;
+    font-weight: 500; cursor: pointer;
+    font: inherit; font-size: 14px;
+  }
+  .modal-deploy:hover { background: var(--accent); }
+  .modal-deploy:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ─── Progress phases ─── */
+  .phases { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 24px; border: 1px solid var(--line); }
+  .phase {
+    padding: 16px 12px;
+    background: white;
+    text-align: center;
+    border-right: 1px solid var(--line);
+    transition: all 0.3s;
+  }
+  .phase:last-child { border-right: none; }
+  .phase.active { background: var(--accent-soft); }
+  .phase.done { background: var(--good-soft); }
+  .phase-icon {
+    width: 22px; height: 22px;
+    margin: 0 auto 6px;
+    border-radius: 50%;
+    border: 2px solid var(--line-2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700;
+    background: white; color: var(--text-2);
+    transition: all 0.3s;
+  }
+  .phase.active .phase-icon { border-color: var(--accent); color: var(--accent); }
+  .phase.done .phase-icon { border-color: var(--good); background: var(--good); color: white; }
+  .phase-label { font-size: 11px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
+  .phase.active .phase-label, .phase.done .phase-label { color: var(--navy); font-weight: 600; }
+
+  .progress-bar-track { height: 3px; background: var(--bg-2); overflow: hidden; margin-bottom: 20px; }
+  .progress-bar-fill { height: 100%; background: var(--accent); transition: width 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  .activity-feed {
+    background: var(--navy); color: rgba(255,255,255,0.85);
+    padding: 16px;
+    height: 200px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .activity-line { color: rgba(255,255,255,0.85); }
+  .activity-line.warning { color: var(--warn); }
+  .activity-line.error { color: #ff7a6e; }
+
+  .result-card { padding: 24px; background: var(--good-soft); border-left: 3px solid var(--good); margin-top: 20px; }
+  .result-card.warning { background: var(--warn-soft); border-color: var(--warn); }
+  .result-card.error { background: var(--bad-soft); border-color: var(--bad); }
+  .result-headline {
+    display: flex; align-items: center; gap: 10px;
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 19px; font-weight: 500; letter-spacing: -0.01em;
+    margin-bottom: 8px; color: var(--navy);
+  }
+  .result-mark {
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--good); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; flex-shrink: 0;
+  }
+  .result-card.warning .result-mark { background: var(--warn); }
+  .result-card.error .result-mark { background: var(--bad); }
+  .result-note { color: var(--text-1); font-size: 14px; margin-bottom: 14px; line-height: 1.55; }
+  .url-box { display: flex; gap: 8px; margin-bottom: 8px; }
+  .url-input {
+    flex: 1; padding: 12px 14px;
+    background: white; border: 1px solid var(--line);
+    color: var(--text-0); font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all;
+  }
+  .copy-btn, .open-btn {
+    padding: 10px 14px;
+    background: white; border: 1px solid var(--line);
+    color: var(--text-0); cursor: pointer;
+    font: inherit; font-size: 13px; font-weight: 500;
+    flex-shrink: 0; text-decoration: none;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .copy-btn:hover, .open-btn:hover { border-color: var(--navy); }
+  .copy-btn.copied { background: var(--good); color: white; border-color: var(--good); }
+  .result-pipeline-link { display: inline-flex; align-items: center; gap: 6px; color: var(--text-1); text-decoration: none; font-size: 13px; margin-top: 6px; }
+  .result-pipeline-link:hover { color: var(--navy); }
+
+  /* ════════════════════════════════════════════════════════════════════════
+     v6.8 — Marketing extras: share receipt · sound toggle · digest page
+     ════════════════════════════════════════════════════════════════════════ */
+
+  /* Share receipt button — sits inside the success result card */
+  .share-receipt-btn {
+    margin-top: 14px;
+    padding: 10px 16px;
+    background: var(--navy);
+    color: white;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: background 0.15s;
+  }
+  .share-receipt-btn:hover { background: var(--accent); }
+
+  /* Receipt modal */
+  .modal.receipt-modal { max-width: 760px; }
+  .receipt-preview {
+    margin: 18px 0 22px;
+    background: var(--navy);
+    border-radius: 10px;
+    overflow: hidden;
+    aspect-ratio: 1200 / 630;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .receipt-preview svg { display: block; }
+  .receipt-loading {
+    color: rgba(255,255,255,0.65);
+    font-size: 14px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .receipt-actions {
+    display: flex; gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+  }
+  .receipt-btn {
+    padding: 10px 16px;
+    background: white;
+    color: var(--text-0);
+    border: 1px solid var(--line);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s;
+  }
+  .receipt-btn:hover { border-color: var(--navy); background: var(--bg-1); }
+  .receipt-btn.primary { background: var(--navy); color: white; border-color: var(--navy); }
+  .receipt-btn.primary:hover { background: var(--accent); border-color: var(--accent); }
+
+  /* Completion-sound toggle (lives in topbar) */
+  .sound-toggle {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--text-1);
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.15s;
+    border-radius: 4px;
+  }
+  .sound-toggle:hover { border-color: var(--navy); color: var(--navy); }
+  .sound-toggle.is-off { opacity: 0.55; }
+
+  /* Digest page */
+  .digest-card {
+    background: white;
+    border: 1px solid var(--line);
+    padding: 36px 40px;
+    margin-bottom: 24px;
+  }
+  .digest-eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-2);
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    margin-bottom: 12px;
+  }
+  .digest-headline-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 24px;
+    margin-bottom: 32px;
+    padding-bottom: 32px;
+    border-bottom: 1px solid var(--line);
+  }
+  @media (max-width: 720px) {
+    .digest-headline-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  .digest-stat {
+    border-left: 2px solid var(--accent);
+    padding-left: 14px;
+  }
+  .digest-stat-num {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 38px;
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    color: var(--navy);
+  }
+  .digest-stat-lbl {
+    font-size: 12px;
+    color: var(--text-2);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-top: 6px;
+    font-weight: 500;
+  }
+  .digest-section { margin-bottom: 32px; }
+  .digest-section h3 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: var(--navy);
+    margin-bottom: 16px;
+  }
+  .digest-bar-row {
+    display: grid;
+    grid-template-columns: 200px 1fr 50px;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+  .digest-bar-label { font-size: 13px; color: var(--text-1); }
+  .digest-bar-track { height: 22px; background: var(--bg-1); overflow: hidden; }
+  .digest-bar-fill { height: 100%; background: var(--digest-bar-color, var(--accent)); }
+  .digest-bar-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-0);
+    font-weight: 500;
+    text-align: right;
+  }
+  .digest-list { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+  .digest-list-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 16px;
+    align-items: baseline;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }
+  .digest-list-row .agent { color: var(--navy); font-weight: 500; }
+  .digest-list-row .meta { color: var(--text-2); font-size: 12.5px; font-family: 'JetBrains Mono', monospace; }
+  .digest-list-row .when { color: var(--text-2); font-size: 12px; font-family: 'JetBrains Mono', monospace; }
+
+  .digest-period-toggle { display: flex; gap: 6px; margin-bottom: 24px; }
+  .digest-period-btn {
+    padding: 7px 14px;
+    background: white;
+    border: 1px solid var(--line);
+    color: var(--text-1);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .digest-period-btn.active {
+    background: var(--navy);
+    color: white;
+    border-color: var(--navy);
+  }
+  .digest-period-btn:hover:not(.active) { border-color: var(--navy); color: var(--navy); }
+
+  /* ════════════════════════════════════════════════════════════════════════
+     v6.1 — Colorful deploy progress overhaul + AI chat widget
+     ════════════════════════════════════════════════════════════════════════ */
+
+  /* The progress modal needs more breathing room — bump max width */
+  .modal.progress-modal { max-width: 720px; padding: 36px; }
+
+  /* ─── Header strip with timer + ETA ─── */
+  .progress-header-strip {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px; gap: 16px;
+  }
+  .progress-meta {
+    display: flex; gap: 18px; align-items: baseline;
+    font-size: 12px; color: var(--text-2);
+    font-family: 'JetBrains Mono', monospace;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .progress-meta-item { display: flex; gap: 6px; align-items: baseline; }
+  .progress-meta-item .v {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 18px; font-weight: 500; letter-spacing: -0.01em;
+    color: var(--navy); text-transform: none;
+  }
+  .progress-meta-item .v.eta-ok { color: var(--good); }
+  .progress-meta-item .v.eta-warn { color: var(--warn); }
+
+  /* ─── Colorful phase pills ─── */
+  .phases-v2 {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 10px; margin-bottom: 22px;
+  }
+  .phase-v2 {
+    position: relative;
+    padding: 14px 12px 12px;
+    border-radius: 10px;
+    background: var(--bg-1);
+    border: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 6px;
+    align-items: center; text-align: center;
+    overflow: hidden;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .phase-v2::before {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(135deg, var(--phase-c1), var(--phase-c2));
+    opacity: 0; transition: opacity 0.4s;
+    z-index: 0;
+  }
+  .phase-v2 > * { position: relative; z-index: 1; }
+  .phase-v2.active { border-color: transparent; transform: translateY(-2px); }
+  .phase-v2.active::before { opacity: 1; }
+  .phase-v2.done { border-color: transparent; }
+  .phase-v2.done::before { opacity: 1; }
+  .phase-v2.active .phase-v2-icon, .phase-v2.done .phase-v2-icon { color: white; }
+  .phase-v2.active .phase-v2-label, .phase-v2.done .phase-v2-label { color: white; font-weight: 600; }
+  .phase-v2.active .phase-v2-sub, .phase-v2.done .phase-v2-sub { color: rgba(255,255,255,0.85); }
+
+  .phase-v2[data-phase="build"]   { --phase-c1: #f59e0b; --phase-c2: #ef4444; }
+  .phase-v2[data-phase="built"]   { --phase-c1: #ef4444; --phase-c2: #ec4899; }
+  .phase-v2[data-phase="deploy"]  { --phase-c1: #ec4899; --phase-c2: #8b5cf6; }
+  .phase-v2[data-phase="verify"]  { --phase-c1: #8b5cf6; --phase-c2: #06b6d4; }
+
+  .phase-v2-icon {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: rgba(255,255,255,0.85);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; color: var(--text-2);
+    transition: all 0.3s;
+  }
+  .phase-v2.active .phase-v2-icon {
+    background: rgba(255,255,255,0.25);
+    box-shadow: 0 0 0 0 rgba(255,255,255,0.6);
+    animation: phase-pulse 1.6s infinite;
+  }
+  .phase-v2.done .phase-v2-icon {
+    background: rgba(255,255,255,0.95); color: var(--navy);
+  }
+  @keyframes phase-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(255,255,255,0.55); }
+    70%  { box-shadow: 0 0 0 10px rgba(255,255,255,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+  }
+  .phase-v2-label {
+    font-size: 11px; font-weight: 500;
+    color: var(--text-1);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .phase-v2-sub {
+    font-size: 10px; color: var(--text-2);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 12px;
+  }
+
+  /* ─── Gradient progress bar with shimmer ─── */
+  .progress-bar-v2-track {
+    height: 6px; background: var(--bg-2); overflow: hidden;
+    border-radius: 999px; margin-bottom: 22px; position: relative;
+  }
+  .progress-bar-v2-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #f59e0b, #ec4899, #8b5cf6, #06b6d4, #10b981);
+    background-size: 200% 100%;
+    transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+    position: relative;
+    border-radius: 999px;
+    animation: gradient-shift 3s ease infinite;
+  }
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50%      { background-position: 100% 50%; }
+  }
+  .progress-bar-v2-fill::after {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent);
+    animation: shimmer 2.2s infinite;
+  }
+  @keyframes shimmer {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+  .progress-bar-v2-track.is-complete .progress-bar-v2-fill {
+    background: var(--good); animation: none;
+  }
+  .progress-bar-v2-track.is-complete .progress-bar-v2-fill::after { display: none; }
+
+  /* ─── URL probe card (sonar pulse) ─── */
+  .probe-card {
+    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+    color: white; border-radius: 12px;
+    padding: 18px 20px; margin-bottom: 18px;
+    display: grid; grid-template-columns: 56px 1fr auto;
+    gap: 16px; align-items: center;
+    position: relative; overflow: hidden;
+  }
+  .probe-card::before {
+    content: ''; position: absolute; top: -40%; right: -10%;
+    width: 280px; height: 280px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.30) 0%, transparent 65%);
+    pointer-events: none;
+  }
+  .probe-card.is-ok {
+    background: linear-gradient(135deg, #064e3b 0%, #047857 100%);
+  }
+  .probe-card.is-timeout {
+    background: linear-gradient(135deg, #4a2510 0%, #92400e 100%);
+  }
+
+  .probe-radar {
+    width: 56px; height: 56px; position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .probe-radar-dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #06b6d4; position: relative; z-index: 2;
+    box-shadow: 0 0 12px rgba(6, 182, 212, 0.8);
+  }
+  .probe-card.is-ok .probe-radar-dot { background: #10b981; box-shadow: 0 0 16px rgba(16, 185, 129, 0.9); }
+  .probe-card.is-timeout .probe-radar-dot { background: #fbbf24; box-shadow: 0 0 12px rgba(251, 191, 36, 0.8); }
+
+  .probe-radar::before, .probe-radar::after {
+    content: ''; position: absolute; inset: 0;
+    border-radius: 50%; border: 2px solid #06b6d4;
+    animation: radar-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+  .probe-radar::after { animation-delay: 1s; }
+  .probe-card.is-ok .probe-radar::before, .probe-card.is-ok .probe-radar::after { border-color: #10b981; animation: none; opacity: 0; }
+  .probe-card.is-timeout .probe-radar::before, .probe-card.is-timeout .probe-radar::after { border-color: #fbbf24; }
+  @keyframes radar-ping {
+    0%   { transform: scale(0.4); opacity: 1; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+
+  .probe-info { position: relative; z-index: 1; }
+  .probe-info-line1 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.10em;
+    color: rgba(255,255,255,0.65);
+    margin-bottom: 4px;
+  }
+  .probe-info-url {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    color: white; word-break: break-all;
+    line-height: 1.4;
+  }
+  .probe-info-status {
+    margin-top: 6px;
+    display: flex; gap: 10px; flex-wrap: wrap;
+    font-size: 11px; color: rgba(255,255,255,0.75);
+  }
+  .probe-step {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .probe-step .ind {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(255,255,255,0.25);
+  }
+  .probe-step.is-active .ind { background: #fbbf24; box-shadow: 0 0 6px #fbbf24; animation: probe-blink 1s infinite; }
+  .probe-step.is-done .ind { background: #10b981; }
+  @keyframes probe-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .probe-attempts {
+    text-align: right; position: relative; z-index: 1;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .probe-attempts-num {
+    font-size: 28px; font-weight: 500; line-height: 1;
+    font-family: 'Source Serif 4', Georgia, serif;
+    color: white;
+  }
+  .probe-attempts-lbl {
+    font-size: 10px; color: rgba(255,255,255,0.65);
+    text-transform: uppercase; letter-spacing: 0.10em;
+    margin-top: 4px;
+  }
+
+  /* ─── Tip carousel — one nice fact at a time during the wait ─── */
+  .tip-card {
+    background: var(--bg-1);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px; margin-bottom: 18px;
+    border-radius: 0 6px 6px 0;
+    display: flex; gap: 12px; align-items: flex-start;
+    min-height: 56px;
+  }
+  .tip-icon {
+    width: 24px; height: 24px; flex-shrink: 0;
+    background: var(--accent-soft);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; color: var(--accent); font-weight: 700;
+  }
+  .tip-content {
+    flex: 1; font-size: 13px; line-height: 1.5; color: var(--text-1);
+  }
+  .tip-content .tip-eyebrow {
+    display: block; font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--text-2); font-weight: 600; margin-bottom: 3px;
+  }
+  .tip-content.fade-in { animation: tip-fade 0.5s ease-out; }
+  @keyframes tip-fade {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ─── Activity feed — keep but slightly nicer ─── */
+  .activity-feed-v2 {
+    background: #0a1628; color: rgba(255,255,255,0.85);
+    padding: 14px 16px;
+    height: 160px; overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+    line-height: 1.65; border-radius: 8px;
+  }
+  .activity-feed-v2 .activity-line { color: rgba(255,255,255,0.85); }
+  .activity-feed-v2 .activity-line.warning { color: #fbbf24; }
+  .activity-feed-v2 .activity-line.error { color: #ff7a6e; }
+  .activity-feed-v2 .activity-line .log-ts { color: rgba(255,255,255,0.4); margin-right: 8px; }
+  .activity-feed-v2::-webkit-scrollbar { width: 6px; }
+  .activity-feed-v2::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+
+  /* ─── Confetti on success ─── */
+  .confetti-layer {
+    position: absolute; inset: 0; pointer-events: none;
+    overflow: hidden; z-index: 10;
+  }
+  .confetti-piece {
+    position: absolute; top: -10px; width: 8px; height: 14px;
+    border-radius: 1px;
+    animation: confetti-fall linear forwards;
+  }
+  @keyframes confetti-fall {
+    0%   { transform: translateY(0) rotate(0deg); opacity: 1; }
+    100% { transform: translateY(640px) rotate(720deg); opacity: 0; }
+  }
+
+  /* ─── Result card upgrade — shine on success ─── */
+  .result-card.success-shine {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.10), rgba(6, 182, 212, 0.10));
+    border-left: 3px solid var(--good);
+    position: relative; overflow: hidden;
+  }
+  .result-card.success-shine::before {
+    content: ''; position: absolute; top: -50%; right: -10%;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(16, 185, 129, 0.18) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  /* ─── AI chat: floating action button ─── */
+  .chat-fab {
+    position: fixed; bottom: 24px; right: 24px;
+    width: 56px; height: 56px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent) 0%, #8b5cf6 100%);
+    color: white; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; font-weight: 600;
+    box-shadow: 0 12px 32px rgba(34, 81, 255, 0.35);
+    z-index: 90;
+    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .chat-fab:hover { transform: translateY(-3px) scale(1.04); }
+  .chat-fab.is-open { transform: rotate(45deg); }
+  .chat-fab .pulse-ring {
+    position: absolute; inset: 0; border-radius: 50%;
+    border: 2px solid rgba(34, 81, 255, 0.5);
+    animation: chat-fab-pulse 2.4s infinite;
+  }
+  @keyframes chat-fab-pulse {
+    0%   { transform: scale(0.95); opacity: 0.7; }
+    70%  { transform: scale(1.4); opacity: 0; }
+    100% { transform: scale(1.4); opacity: 0; }
+  }
+
+  /* ─── AI chat: side panel ─── */
+  .chat-panel {
+    position: fixed; bottom: 96px; right: 24px;
+    width: 380px; max-width: calc(100vw - 32px);
+    height: 560px; max-height: calc(100vh - 120px);
+    background: white;
+    border: 1px solid var(--line);
+    box-shadow: 0 24px 64px rgba(5, 28, 44, 0.20);
+    border-radius: 14px;
+    display: flex; flex-direction: column;
+    z-index: 95;
+    overflow: hidden;
+    animation: chat-slide-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes chat-slide-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .chat-panel-header {
+    background: linear-gradient(135deg, var(--navy) 0%, #1e3a8a 100%);
+    color: white;
+    padding: 16px 18px;
+    display: flex; align-items: center; gap: 12px;
+    flex-shrink: 0;
+  }
+  .chat-avatar {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: linear-gradient(135deg, #8b5cf6, #06b6d4);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700;
+    flex-shrink: 0;
+  }
+  .chat-title-block { flex: 1; min-width: 0; }
+  .chat-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 16px; font-weight: 500; letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .chat-status-line {
+    font-size: 11px; color: rgba(255,255,255,0.65);
+    display: flex; align-items: center; gap: 6px; margin-top: 2px;
+  }
+  .chat-status-line .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #10b981; box-shadow: 0 0 6px #10b981;
+  }
+  .chat-close-btn {
+    width: 28px; height: 28px;
+    background: rgba(255,255,255,0.10); border: none;
+    color: white; cursor: pointer; border-radius: 6px;
+    font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .chat-close-btn:hover { background: rgba(255,255,255,0.20); }
+
+  .chat-body {
+    flex: 1; overflow-y: auto;
+    padding: 16px; display: flex; flex-direction: column; gap: 12px;
+    background: var(--bg-1);
+  }
+  .chat-body::-webkit-scrollbar { width: 5px; }
+  .chat-body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  .chat-msg { display: flex; gap: 8px; max-width: 100%; }
+  .chat-msg.user { justify-content: flex-end; }
+  .chat-bubble {
+    padding: 10px 14px; border-radius: 14px;
+    font-size: 13.5px; line-height: 1.5;
+    max-width: 85%;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+  }
+  .chat-msg.assistant .chat-bubble {
+    background: white; color: var(--text-0);
+    border: 1px solid var(--line);
+    border-bottom-left-radius: 4px;
+  }
+  .chat-msg.user .chat-bubble {
+    background: linear-gradient(135deg, var(--accent), #6366f1);
+    color: white;
+    border-bottom-right-radius: 4px;
+  }
+  .chat-msg.error .chat-bubble {
+    background: var(--bad-soft); color: var(--bad);
+    border: 1px solid rgba(224, 48, 30, 0.20);
+  }
+  .chat-typing {
+    display: inline-flex; gap: 4px; padding: 4px 0;
+  }
+  .chat-typing span {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--text-2); animation: typing-bounce 1.2s infinite;
+  }
+  .chat-typing span:nth-child(2) { animation-delay: 0.15s; }
+  .chat-typing span:nth-child(3) { animation-delay: 0.30s; }
+  @keyframes typing-bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30%           { transform: translateY(-4px); opacity: 1; }
+  }
+
+  .chat-suggestions {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 10px 14px 0;
+  }
+  .chat-chip {
+    padding: 7px 12px;
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font: inherit; font-size: 12px;
+    color: var(--text-1); cursor: pointer;
+    transition: all 0.15s;
+  }
+  .chat-chip:hover {
+    border-color: var(--accent); color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .chat-input-row {
+    display: flex; gap: 8px; padding: 12px 14px;
+    border-top: 1px solid var(--line);
+    background: white; flex-shrink: 0;
+  }
+  .chat-input {
+    flex: 1; padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px; font: inherit; font-size: 13.5px;
+    color: var(--text-0); background: var(--bg-1);
+    resize: none; max-height: 120px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .chat-input:focus { border-color: var(--accent); background: white; }
+  .chat-send-btn {
+    padding: 0 14px;
+    background: var(--navy); color: white;
+    border: none; cursor: pointer;
+    border-radius: 8px; font-weight: 500;
+    font: inherit; font-size: 13px;
+    display: flex; align-items: center; gap: 4px;
+    transition: background 0.15s;
+  }
+  .chat-send-btn:hover:not(:disabled) { background: var(--accent); }
+  .chat-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* On small screens, take over the bottom of the screen */
+  @media (max-width: 520px) {
+    .chat-panel {
+      right: 8px; left: 8px; bottom: 86px;
+      width: auto; height: 70vh;
+    }
+    .chat-fab { right: 16px; bottom: 16px; }
+    .modal.progress-modal { padding: 24px 20px; }
+    .phases-v2 { gap: 6px; }
+    .probe-card { grid-template-columns: 44px 1fr; gap: 12px; padding: 14px; }
+    .probe-attempts { display: none; }
+  }
+
+  /* ════════════════════════════════════════════════════════════════════════
+     v6.4 — Countdown timeline: 6 phases × predictable durations = 5 min total
+     Replaces the showcase + probe + tip carousel with a single big circular
+     countdown. Each phase ticks down to 0, then advances. Build → Push →
+     Deploy → Startup → Verify → Live. Total wall time = 60+60+60+60+30+30s.
+     ════════════════════════════════════════════════════════════════════════ */
+
+  /* 6-step indicator: dots connected by a thin line */
+  .steps-strip {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 28px; padding: 0 4px;
+    position: relative;
+  }
+  .steps-strip::before {
+    content: ''; position: absolute;
+    top: 11px; left: 24px; right: 24px;
+    height: 2px; background: var(--line);
+    z-index: 0;
+  }
+  .step-cell {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 8px; flex: 1; min-width: 0;
+    position: relative; z-index: 1;
+  }
+  .step-dot {
+    width: 22px; height: 22px; border-radius: 50%;
+    background: white; border: 2px solid var(--line);
+    color: var(--text-2); font-size: 10px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    flex-shrink: 0;
+  }
+  .step-cell.is-active .step-dot {
+    background: var(--step-color, var(--accent));
+    border-color: var(--step-color, var(--accent));
+    color: white;
+    box-shadow: 0 0 0 4px var(--step-color-soft, var(--accent-soft));
+    animation: step-throb 1.6s infinite;
+  }
+  .step-cell.is-done .step-dot {
+    background: var(--good); border-color: var(--good); color: white;
+  }
+  @keyframes step-throb {
+    0%, 100% { box-shadow: 0 0 0 4px var(--step-color-soft, var(--accent-soft)); }
+    50%      { box-shadow: 0 0 0 8px var(--step-color-soft, var(--accent-soft)); }
+  }
+  .step-label {
+    font-size: 10.5px; color: var(--text-2);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    font-weight: 500; text-align: center;
+    line-height: 1.2;
+  }
+  .step-cell.is-active .step-label { color: var(--navy); font-weight: 700; }
+  .step-cell.is-done .step-label { color: var(--text-1); }
+
+  /* Big circular countdown — the centerpiece */
+  .countdown-card {
+    background: linear-gradient(180deg, white 0%, var(--bg-1) 100%);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 28px 24px 24px;
+    margin-bottom: 22px;
+    position: relative;
+    overflow: hidden;
+    text-align: center;
+  }
+  .countdown-card::before {
+    content: ''; position: absolute;
+    top: -40%; left: 50%; transform: translateX(-50%);
+    width: 360px; height: 360px;
+    background: radial-gradient(circle, var(--phase-glow, rgba(34, 81, 255, 0.10)) 0%, transparent 65%);
+    pointer-events: none; z-index: 0;
+    transition: background 0.6s ease;
+  }
+  .countdown-wrap {
+    position: relative; z-index: 1;
+    width: 180px; height: 180px;
+    margin: 0 auto 18px;
+  }
+  .countdown-svg {
+    width: 100%; height: 100%; transform: rotate(-90deg);
+  }
+  .countdown-track-circle {
+    fill: none; stroke: var(--bg-2); stroke-width: 8;
+  }
+  .countdown-fill-circle {
+    fill: none; stroke: var(--phase-color, var(--accent));
+    stroke-width: 8; stroke-linecap: round;
+    transition: stroke-dashoffset 1s linear, stroke 0.6s ease;
+  }
+  .countdown-num {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    pointer-events: none;
+  }
+  .countdown-num-val {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 64px; font-weight: 500;
+    line-height: 1; letter-spacing: -0.04em;
+    color: var(--navy);
+    transition: color 0.3s;
+  }
+  .countdown-num.urgent .countdown-num-val { color: var(--phase-color, var(--accent)); }
+  .countdown-num-unit {
+    font-size: 11px; color: var(--text-2);
+    text-transform: uppercase; letter-spacing: 0.10em;
+    margin-top: 4px; font-weight: 600;
+  }
+
+  .countdown-label {
+    position: relative; z-index: 1;
+  }
+  .countdown-phase-name {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 22px; font-weight: 500; letter-spacing: -0.01em;
+    color: var(--navy); margin-bottom: 4px;
+    line-height: 1.2;
+  }
+  .countdown-phase-msg {
+    font-size: 13px; color: var(--text-1);
+    line-height: 1.5;
+    max-width: 480px; margin: 0 auto;
+  }
+  .countdown-fade-in {
+    animation: countdown-fade 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes countdown-fade {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Dotted particles around the ring while active — subtle motion */
+  .countdown-orbits {
+    position: absolute; inset: 0;
+    pointer-events: none; z-index: 0;
+  }
+  .countdown-orbit {
+    position: absolute; top: 50%; left: 50%;
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--phase-color, var(--accent));
+    margin: -2px 0 0 -2px;
+    opacity: 0.6;
+    animation: orbit 8s linear infinite;
+  }
+  .countdown-orbit:nth-child(2) { animation-duration: 11s; animation-direction: reverse; opacity: 0.4; }
+  .countdown-orbit:nth-child(3) { animation-duration: 14s; opacity: 0.5; }
+  @keyframes orbit {
+    from { transform: rotate(0deg) translateX(102px) rotate(0deg); }
+    to   { transform: rotate(360deg) translateX(102px) rotate(-360deg); }
+  }
+
+  /* On small screens — shrink everything */
+  @media (max-width: 520px) {
+    .steps-strip { margin-bottom: 20px; }
+    .steps-strip::before { left: 16px; right: 16px; }
+    .step-label { font-size: 9px; }
+    .countdown-wrap { width: 140px; height: 140px; }
+    .countdown-num-val { font-size: 48px; }
+    .countdown-phase-name { font-size: 18px; }
+    .countdown-card { padding: 20px 16px 18px; }
+  }
+
+  /* ─── Analytics ─── */
+  .analytics-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 24px;
+    margin-bottom: 24px;
+  }
+  .chart-card {
+    background: white;
+    border: 1px solid var(--line);
+    padding: 28px;
+  }
+  .chart-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 19px; font-weight: 500;
+    color: var(--navy); letter-spacing: -0.01em;
+    margin-bottom: 24px;
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px;
+  }
+  .chart-title-meta { font-family: 'Inter', sans-serif; font-size: 12px; color: var(--text-2); font-weight: 400; }
+  .bar-chart { display: flex; flex-direction: column; gap: 14px; }
+  .bar-row { display: flex; align-items: center; gap: 12px; }
+  .bar-label { font-size: 13px; color: var(--text-1); width: 140px; flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
+  .bar-label .dot { width: 8px; height: 8px; border-radius: 2px; background: var(--bar-color, var(--accent)); }
+  .bar-track { flex: 1; height: 28px; background: var(--bg-1); position: relative; border-radius: 0; }
+  .bar-fill { height: 100%; background: var(--bar-color, var(--accent)); transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1); }
+  .bar-value { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-0); font-weight: 500; min-width: 64px; text-align: right; }
+
+  .donut-wrap { display: flex; flex-direction: column; align-items: center; gap: 20px; }
+  .donut-legend { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+  .legend-item { font-size: 13px; color: var(--text-1); display: flex; align-items: center; gap: 8px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; background: var(--legend-color); flex-shrink: 0; }
+  .legend-spacer { flex: 1; }
+  .legend-value { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-0); font-weight: 500; }
+
+  .three-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+
+  .cost-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .cost-row-meta { display: flex; justify-content: space-between; font-size: 13px; }
+  .cost-row-meta .l { color: var(--text-1); }
+  .cost-row-meta .v { font-family: 'JetBrains Mono', monospace; color: var(--text-0); font-weight: 500; }
+  .cost-bar { height: 4px; background: var(--bg-1); }
+  .cost-bar-fill { height: 100%; background: var(--cost-color, var(--accent)); }
+  .cost-total { margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; font-size: 14px; }
+  .cost-total .l { color: var(--text-2); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; font-size: 11px; }
+  .cost-total .v { font-family: 'Source Serif 4', Georgia, serif; font-size: 22px; font-weight: 500; color: var(--navy); }
+
+  .speed-num { text-align: center; padding: 12px; }
+  .speed-val { font-family: 'Source Serif 4', Georgia, serif; font-size: 56px; font-weight: 500; letter-spacing: -0.03em; color: var(--good); line-height: 1; }
+  .speed-val .unit { font-size: 22px; color: var(--text-2); margin-left: 4px; font-weight: 400; }
+  .speed-lbl { font-size: 12px; color: var(--text-2); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .speed-callout {
+    margin-top: 16px;
+    background: var(--good-soft);
+    border-left: 2px solid var(--good);
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--navy);
+    line-height: 1.5;
+  }
+
+  .success-num { text-align: center; padding: 12px 0; }
+  .success-val { font-family: 'Source Serif 4', Georgia, serif; font-size: 64px; font-weight: 500; letter-spacing: -0.03em; color: var(--good); line-height: 1; }
+  .success-rows { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
+  .success-row { display: flex; justify-content: space-between; font-size: 13px; }
+  .success-row .l { color: var(--text-1); }
+  .success-row .v { font-family: 'JetBrains Mono', monospace; color: var(--text-0); }
+
+  /* ─── Users / RBAC ─── */
+  .roles-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-bottom: 40px; }
+  .role-card {
+    background: white;
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--role-color);
+    padding: 28px;
+  }
+  .role-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 22px; font-weight: 500;
+    color: var(--navy); letter-spacing: -0.01em;
+    margin-bottom: 6px;
+  }
+  .role-meta { font-size: 13px; color: var(--text-2); margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; }
+  .role-count { font-family: 'JetBrains Mono', monospace; color: var(--text-0); font-weight: 500; }
+  .perm-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+  .perm-item {
+    font-size: 13px; line-height: 1.5;
+    display: flex; gap: 10px;
+    color: var(--text-1);
+  }
+  .perm-item::before {
+    content: '✓';
+    color: var(--good);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .perm-item.no { color: var(--text-2); }
+  .perm-item.no::before { content: '×'; color: var(--bad); }
+
+  /* ─── ROI ─── */
+  .roi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    margin-bottom: 56px;
+  }
+  .roi-card {
+    background: white;
+    padding: 32px 28px;
+    text-align: left;
+  }
+  .roi-val {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 56px; font-weight: 500; letter-spacing: -0.03em;
+    color: var(--navy);
+    line-height: 1;
+    margin-bottom: 12px;
+  }
+  .roi-val.accent { color: var(--accent); }
+  .roi-val.good { color: var(--good); }
+  .roi-lbl {
+    font-size: 14px; font-weight: 600;
+    color: var(--navy);
+    margin-bottom: 6px;
+  }
+  .roi-sub { font-size: 13px; color: var(--text-2); line-height: 1.5; }
+
+  .roadmap-section h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 36px; font-weight: 400;
+    letter-spacing: -0.02em; line-height: 1.1;
+    color: var(--navy);
+    margin-bottom: 12px;
+  }
+  .roadmap-section .lead { color: var(--text-1); font-size: 16px; max-width: 640px; margin-bottom: 32px; }
+  .roadmap-list { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--line); }
+  .roadmap-item {
+    padding: 24px;
+    background: white;
+    border-bottom: 1px solid var(--line);
+    display: flex; gap: 24px; align-items: flex-start;
+  }
+  .roadmap-item:last-child { border-bottom: none; }
+  .roadmap-item:hover { background: var(--bg-1); }
+  .rm-badge {
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 4px 10px;
+    flex-shrink: 0;
+    min-width: 60px;
+    text-align: center;
+  }
+  .rm-badge.now { background: var(--good); color: white; }
+  .rm-badge.q2 { background: var(--accent); color: white; }
+  .rm-badge.q3 { background: var(--accent-2); color: white; }
+  .rm-badge.q4 { background: var(--text-2); color: white; }
+  .rm-content { flex: 1; }
+  .rm-title { font-weight: 600; color: var(--navy); margin-bottom: 6px; font-size: 15px; }
+  .rm-desc { font-size: 13px; color: var(--text-1); line-height: 1.55; }
+
+  /* ─── Toast ─── */
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    padding: 14px 18px;
+    background: var(--navy); color: white;
+    z-index: 200; font-size: 14px; max-width: 360px;
+    box-shadow: 0 12px 32px rgba(5, 28, 44, 0.30);
+    animation: slide-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes slide-in { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+  .loading-skeleton { background: linear-gradient(90deg, var(--bg-1) 0%, var(--bg-2) 50%, var(--bg-1) 100%); background-size: 200% 100%; animation: shimmer 1.5s infinite; min-height: 24px; }
+  @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+'use strict';
+
+var state = {
+  user: null,
+  agents: [],
+  regions: [],
+  deployments: [],
+  view: 'login',
+  filter: { category: 'All', q: '' },
+  metrics: null,         // overview cache
+  metricsRegions: null,
+  metricsCost: null,
+  metricsAgents: null,
+  metricsDeploy: null,
+  users: null,
+  roi: null,
+};
+
+var activeProgress = null;
+var deployModal = null;
+var filterDebounceTimer = null;
+var app = document.getElementById('app');
+
+async function api(path, opts) {
+  opts = opts || {};
+  // Merge our default headers with whatever the caller passed. The
+  // X-Requested-With header is required by the server's CSRF defense.
+  var headers = Object.assign({
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'agentos'
+  }, opts.headers || {});
+  var r = await fetch(path, Object.assign({
+    credentials: 'same-origin'
+  }, opts, { headers: headers }));
+  if (!r.ok) {
+    var err = { error: 'HTTP ' + r.status };
+    try { err = await r.json(); } catch (e) {}
+    throw new Error(err.error || err.message || ('HTTP ' + r.status));
+  }
+  return r.json();
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
+}
+function escapeAttr(s) { return escapeHtml(s); }
+function formatMoney(n) { return '$' + (Math.round(n * 100) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+function formatNumber(n) { return Number(n).toLocaleString('en-US'); }
+function relativeTime(iso) {
+  if (!iso) return '—';
+  var s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  if (s < 86400) return Math.round(s/3600) + 'h ago';
+  return Math.round(s/86400) + 'd ago';
+}
+function showToast(msg) {
+  var t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function() { t.remove(); }, 4000);
+}
+
+function render() {
+  if (!state.user) { renderLogin(); return; }
+  if (state.view === 'dashboard') return renderDashboard();
+  if (state.view === 'analytics') return renderAnalytics();
+  if (state.view === 'users') return renderUsers();
+  if (state.view === 'roi') return renderRoi();
+  if (state.view === 'digest') return renderDigest();
+  renderMarketplace();
+}
+
+// Mount the chat FAB once after every render so navigation never loses it
+var _origRender = render;
+render = function() {
+  _origRender();
+  if (state.user) ensureChatFab();
+  else removeChatUi();
+};
+
+function renderLogin() {
+  app.innerHTML = ''
+    + '<div class="login-page">'
+    +   '<div class="splash">'
+    +     '<div class="splash-mark">A</div>'
+    +     '<div>'
+    +       '<h1 class="splash-headline">Enterprise AI agents,<br><em>deployable.</em></h1>'
+    +       '<p class="splash-sub">A multi-region platform for shipping AI agents to production. '
+    +       'Tenant-isolated, region-resident, governed by enterprise IAM and CI/CD.</p>'
+    +     '</div>'
+    +     '<div class="splash-foot">AgentOS · v6.0 · Multi-region</div>'
+    +   '</div>'
+    +   '<div class="login-card">'
+    +     '<div class="login-card-inner">'
+    +       '<h2>Sign in</h2>'
+    +       '<p class="desc">Use the demo credentials below or your enterprise SSO.</p>'
+    +       '<form id="login-form">'
+    +         '<div class="form-row">'
+    +           '<label for="email">Email</label>'
+    +           '<input type="email" id="email" value="admin@demo.com" required>'
+    +         '</div>'
+    +         '<div class="form-row">'
+    +           '<label for="password">Password</label>'
+    +           '<input type="password" id="password" value="demo123" required>'
+    +         '</div>'
+    +         '<button type="submit" class="btn btn-primary">Sign in</button>'
+    +         '<button type="button" class="btn azure-btn">Continue with Microsoft Azure AD</button>'
+    +         '<div id="login-error"></div>'
+    +       '</form>'
+    +       '<div class="demo-hint">'
+    +         '<strong>Demo:</strong> <code>admin@demo.com</code> / <code>demo123</code><br>'
+    +         '<span style="color: var(--text-2);">Read-only: <code>viewer@demo.com</code></span>'
+    +       '</div>'
+    +     '</div>'
+    +   '</div>'
+    + '</div>';
+
+  document.getElementById('login-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var errBox = document.getElementById('login-error');
+    errBox.innerHTML = '';
+    try {
+      var res = await api('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: document.getElementById('email').value,
+          password: document.getElementById('password').value
+        })
+      });
+      state.user = res.user;
+      await loadCatalog();
+      state.view = 'marketplace';
+      render();
+    } catch (err) {
+      errBox.innerHTML = '<div class="login-error">' + escapeHtml(err.message) + '</div>';
+    }
+  });
+}
+
+async function loadCatalog() {
+  var cat = await api('/api/agents');
+  var dep = await api('/api/deployments');
+  state.agents = cat.agents;
+  state.regions = cat.regions;
+  state.deployments = dep.deployments;
+}
+
+function topbarHtml() {
+  var nameSrc = state.user.name || state.user.email;
+  var initials = nameSrc.split(' ').map(function(s){return s[0];}).join('').slice(0,2).toUpperCase();
+  var regionsLabel = state.regions.map(function(r){return r.flag + ' ' + r.shortName;}).join(' · ');
+  function navBtn(view, label, badge) {
+    return '<button class="nav-item ' + (state.view===view?'active':'') + '" data-view="' + view + '">'
+      + label
+      + (badge ? '<span class="nav-badge">' + badge + '</span>' : '')
+      + '</button>';
+  }
+  return ''
+    + '<div class="topbar">'
+    +   '<div class="topbar-mark">A</div>'
+    +   '<div class="topbar-name">AgentOS<span>v6 · Multi-region</span></div>'
+    +   '<div class="nav">'
+    +     navBtn('marketplace', 'Catalog')
+    +     navBtn('dashboard', 'Deployments', state.deployments.length || null)
+    +     navBtn('analytics', 'Analytics')
+    +     navBtn('users', 'Users')
+    +     navBtn('roi', 'Business case')
+    +     (state.user.role === 'admin' ? navBtn('digest', 'Digest') : '')
+    +   '</div>'
+    +   '<div class="topbar-right">'
+    +     '<button class="sound-toggle ' + (isCompletionSoundOff() ? 'is-off' : '') + '" id="sound-toggle" title="Audio when deploys finish">'
+    +       (isCompletionSoundOff() ? '🔇' : '🔊') + ' <span style="font-size:10px">Sound</span>'
+    +     '</button>'
+    +     '<div class="topbar-region">' + regionsLabel + '</div>'
+    +     '<div class="topbar-user"><div class="avatar">' + initials + '</div><span class="user-name">' + escapeHtml(state.user.name) + '</span></div>'
+    +     '<span class="signout-link" id="signout">Sign out</span>'
+    +   '</div>'
+    + '</div>';
+}
+
+function isCompletionSoundOff() {
+  try { return localStorage.getItem('agentos-completion-sound') === 'off'; } catch (e) { return false; }
+}
+
+function wireTopbar() {
+  document.getElementById('signout').addEventListener('click', signOut);
+  var soundBtn = document.getElementById('sound-toggle');
+  if (soundBtn) {
+    soundBtn.addEventListener('click', function() {
+      var off = isCompletionSoundOff();
+      try { localStorage.setItem('agentos-completion-sound', off ? 'on' : 'off'); } catch (e) {}
+      soundBtn.classList.toggle('is-off', !off);
+      soundBtn.innerHTML = (!off ? '🔇' : '🔊') + ' <span style="font-size:10px">Sound</span>';
+      showToast(!off ? 'Completion sound off' : 'Completion sound on');
+    });
+  }
+  document.querySelectorAll('.nav-item').forEach(function(b) {
+    b.addEventListener('click', function() { state.view = b.dataset.view; render(); });
+  });
+}
+
+// ─── Marketplace ──────────────────────────────────────────────────────────────
+function renderMarketplace() {
+  var cats = ['All'].concat(Array.from(new Set(state.agents.map(function(a){return a.category;}))));
+  var q = state.filter.q.toLowerCase();
+  var filtered = state.agents.filter(function(a) {
+    if (state.filter.category !== 'All' && a.category !== state.filter.category) return false;
+    if (q && !((a.name + ' ' + a.description + ' ' + (a.tags||[]).join(' ')).toLowerCase().includes(q))) return false;
+    return true;
+  });
+
+  app.innerHTML = ''
+    + topbarHtml()
+    + '<div class="page-wrapper">'
+    +   '<div class="page-eyebrow">Catalog</div>'
+    +   '<h1 class="page-title">Twenty-five enterprise agents.<br><em>One click to deploy.</em></h1>'
+    +   '<p class="page-sub">Pick an agent, pick a cloud, pick a region, click deploy. The platform handles provisioning, secrets, networking, and compliance — region-resident, tenant-isolated, governed by your IAM. Now deploys to <strong>Azure</strong> (UAE North · UK South) and <strong>AWS</strong> (UAE Central · Bahrain).</p>'
+    +   voiceTourHtml()
+    +   '<div class="page-divider"></div>'
+    +   '<div class="filters">'
+    +     '<input type="text" class="search-box" id="search" placeholder="Search agents…" value="' + escapeAttr(state.filter.q) + '">'
+    +     '<div class="pills">'
+    +       cats.map(function(c) {
+            return '<button class="pill ' + (c===state.filter.category?'active':'') + '" data-cat="' + escapeAttr(c) + '">' + escapeHtml(c) + '</button>';
+          }).join('')
+    +     '</div>'
+    +   '</div>'
+    +   '<div class="grid">'
+    +     filtered.map(agentCardHtml).join('')
+    +   '</div>'
+    + '</div>';
+
+  wireTopbar();
+  wireVoiceTour();
+  document.querySelectorAll('.pill').forEach(function(p) {
+    p.addEventListener('click', function() { state.filter.category = p.dataset.cat; render(); });
+  });
+  document.getElementById('search').addEventListener('input', function(e) {
+    state.filter.q = e.target.value;
+    clearTimeout(filterDebounceTimer);
+    filterDebounceTimer = setTimeout(render, 200);
+  });
+  document.querySelectorAll('.deploy-btn').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var a = state.agents.find(function(x){return x.id === b.dataset.agent;});
+      openDeployModal(a);
+    });
+  });
+}
+
+// ─── Voice tour (ElevenLabs) ──────────────────────────────────────────────────
+// Renders a 30-second voice walkthrough strip at the top of the marketplace.
+// First request per language hits the /api/voiceover endpoint and may take 3-5s
+// while ElevenLabs generates; subsequent requests serve from the server-side
+// cache instantly.
+
+var voiceTourLanguages = [
+  // Default set — server returns the authoritative list at /api/voiceover/languages
+  { code: 'en', name: 'English',  native: 'English' },
+  { code: 'ar', name: 'Arabic',   native: 'العربية' },
+  { code: 'hi', name: 'Hindi',    native: 'हिन्दी' },
+  { code: 'fr', name: 'French',   native: 'Français' },
+  { code: 'es', name: 'Spanish',  native: 'Español' },
+];
+var voiceTourSelectedLang = localStorage.getItem('voice-tour-lang') || 'en';
+
+function voiceTourHtml() {
+  var opts = voiceTourLanguages.map(function(l) {
+    var sel = l.code === voiceTourSelectedLang ? ' selected' : '';
+    return '<option value="' + l.code + '"' + sel + '>' + escapeHtml(l.native) + '</option>';
+  }).join('');
+  return ''
+    + '<div class="voice-tour" id="voice-tour">'
+    +   '<div class="voice-tour-icon">🎧</div>'
+    +   '<div class="voice-tour-text">'
+    +     '<div class="voice-tour-eyebrow">30-second voice tour</div>'
+    +     '<div class="voice-tour-title">Hear how AgentOS deploys your agent</div>'
+    +   '</div>'
+    +   '<div class="voice-tour-controls">'
+    +     '<select class="voice-lang-select" id="voice-lang">' + opts + '</select>'
+    +     '<button class="voice-play-btn" id="voice-play-btn">▶ Listen</button>'
+    +   '</div>'
+    +   '<div id="voice-audio-slot"></div>'
+    + '</div>';
+}
+
+function wireVoiceTour() {
+  // Refresh languages from server (in case more were added since last render)
+  api('/api/voiceover/languages').then(function(r) {
+    if (r && Array.isArray(r.languages) && r.languages.length) {
+      voiceTourLanguages = r.languages;
+      var select = document.getElementById('voice-lang');
+      if (select) {
+        select.innerHTML = voiceTourLanguages.map(function(l) {
+          var sel = l.code === voiceTourSelectedLang ? ' selected' : '';
+          return '<option value="' + l.code + '"' + sel + '>' + escapeHtml(l.native) + '</option>';
+        }).join('');
+      }
+    }
+  }).catch(function(){});
+
+  var langSelect = document.getElementById('voice-lang');
+  var playBtn = document.getElementById('voice-play-btn');
+  var slot = document.getElementById('voice-audio-slot');
+  if (!langSelect || !playBtn) return;
+
+  langSelect.addEventListener('change', function() {
+    voiceTourSelectedLang = langSelect.value;
+    try { localStorage.setItem('voice-tour-lang', voiceTourSelectedLang); } catch (e) {}
+    // Clear any previously loaded audio so the next play uses the new language
+    slot.innerHTML = '';
+    playBtn.innerHTML = '▶ Listen';
+  });
+
+  playBtn.addEventListener('click', async function() {
+    var lang = langSelect.value;
+    playBtn.disabled = true;
+    playBtn.innerHTML = 'Generating <span class="dots"><span></span><span></span><span></span></span>';
+    slot.innerHTML = '';
+
+    try {
+      // Fetch the audio. First call per language may take 3-5s while ElevenLabs
+      // generates; subsequent calls are instant from the server-side cache.
+      var resp = await fetch('/api/voiceover/' + encodeURIComponent(lang), {
+        credentials: 'same-origin',
+      });
+      if (!resp.ok) {
+        var err;
+        try { err = await resp.json(); } catch (e) { err = { error: 'HTTP ' + resp.status }; }
+        throw new Error(err.error || ('HTTP ' + resp.status));
+      }
+      var blob = await resp.blob();
+      var url = URL.createObjectURL(blob);
+
+      slot.innerHTML = ''
+        + '<div class="voice-audio-wrap">'
+        +   '<audio controls autoplay src="' + url + '"></audio>'
+        + '</div>';
+      playBtn.innerHTML = '↻ Play again';
+      playBtn.disabled = false;
+    } catch (err) {
+      slot.innerHTML = ''
+        + '<div class="voice-tour-error">'
+        +   '<strong>Voice tour unavailable.</strong> ' + escapeHtml(err.message)
+        + '</div>';
+      playBtn.innerHTML = '▶ Listen';
+      playBtn.disabled = false;
+    }
+  });
+}
+
+function agentCardHtml(a, i) {
+  var canDeploy = a.live && a.cicdProvider !== null;
+  var showcaseDisabled = !a.showcaseUrl;
+  return ''
+    + '<div class="card" style="--card-color: ' + a.color + '; --i: ' + i + ';">'
+    +   '<div class="card-icon">' + a.icon + '</div>'
+    +   '<div class="card-header">'
+    +     '<div class="card-badge">' + escapeHtml(a.badge) + '</div>'
+    +     '<div class="card-status ' + (a.live?'':'coming-soon') + '">'
+    +       '<span class="dot"></span>' + (a.live?'Live':'Soon')
+    +     '</div>'
+    +   '</div>'
+    +   '<h3>' + escapeHtml(a.name) + '</h3>'
+    +   '<div class="card-desc">' + escapeHtml(a.description) + '</div>'
+    +   '<div class="card-tags">'
+    +     (a.tags||[]).slice(0,3).map(function(t){return '<span class="card-tag">'+escapeHtml(t)+'</span>';}).join('')
+    +   '</div>'
+    +   '<div class="card-actions">'
+    +     '<a class="card-cta ' + (showcaseDisabled?'disabled':'') + '" href="' + (a.showcaseUrl||'#') + '" target="_blank" rel="noopener">Open ↗</a>'
+    +     '<button class="card-cta primary deploy-btn ' + (canDeploy?'':'disabled') + '" data-agent="' + a.id + '" ' + (canDeploy?'':'disabled') + '>'
+    +       (canDeploy?'Deploy':'Coming soon')
+    +     '</button>'
+    +   '</div>'
+    + '</div>';
+}
+
+// ─── Deploy modal ─────────────────────────────────────────────────────────────
+function openDeployModal(agent) {
+  closeDeployModal();
+  deployModal = { agent: agent, step: 'cloud', selectedCloud: null, selectedRegion: null };
+  var wrap = document.createElement('div');
+  wrap.className = 'modal-bg';
+  wrap.id = 'deploy-modal-bg';
+  document.body.appendChild(wrap);
+  renderDeployModal();
+  wrap.addEventListener('click', function(e) {
+    if (e.target.id === 'deploy-modal-bg') closeDeployModal();
+  });
+}
+
+function closeDeployModal() {
+  deployModal = null;
+  var el = document.getElementById('deploy-modal-bg');
+  if (el) el.remove();
+}
+
+function renderDeployModal() {
+  if (!deployModal) return;
+  var m = deployModal;
+  var wrap = document.getElementById('deploy-modal-bg');
+  wrap.innerHTML = ''
+    + '<div class="modal">'
+    +   '<button class="modal-close" id="deploy-close">×</button>'
+    +   '<h2>Deploy ' + escapeHtml(m.agent.name) + '</h2>'
+    +   '<p class="modal-sub">' + escapeHtml(m.agent.description) + '</p>'
+    +   (m.step === 'cloud' ? cloudPickerHtml(m.agent) : '')
+    +   (m.step === 'region' ? regionPickerHtml(m.agent) : '')
+    +   '<div class="modal-footer">'
+    +     (m.step === 'region' ? '<button class="modal-back" id="back-btn">← Back</button>' : '')
+    +     (m.step === 'cloud' ? '<button class="modal-deploy" id="next-btn" ' + (m.selectedCloud?'':'disabled') + '>Continue →</button>' : '')
+    +     (m.step === 'region' ? '<button class="modal-deploy" id="deploy-now-btn" ' + (m.selectedRegion?'':'disabled') + '>Deploy now →</button>' : '')
+    +   '</div>'
+    + '</div>';
+
+  document.getElementById('deploy-close').addEventListener('click', closeDeployModal);
+
+  if (m.step === 'cloud') {
+    document.querySelectorAll('.target-card').forEach(function(c) {
+      c.addEventListener('click', function() {
+        if (c.classList.contains('disabled')) return;
+        m.selectedCloud = c.dataset.cloud;
+        m.selectedRegion = null;
+        renderDeployModal();
+      });
+    });
+    var nextBtn = document.getElementById('next-btn');
+    if (nextBtn) nextBtn.addEventListener('click', function() { m.step = 'region'; renderDeployModal(); });
+  }
+  if (m.step === 'region') {
+    document.querySelectorAll('.region-card').forEach(function(c) {
+      c.addEventListener('click', function() { m.selectedRegion = c.dataset.region; renderDeployModal(); });
+    });
+    document.getElementById('back-btn').addEventListener('click', function() { m.step = 'cloud'; renderDeployModal(); });
+    document.getElementById('deploy-now-btn').addEventListener('click', deployNow);
+  }
+}
+
+function cloudPickerHtml(agent) {
+  var m = deployModal;
+  var availableClouds = new Set((agent.availableRegionDetails||[]).map(function(r){return r.cloud;}));
+  var clouds = [
+    { id:'azure', name:'Microsoft Azure', desc:'Container Apps · 2 regions · ~$120/mo foundation', enabled: availableClouds.has('azure') },
+    { id:'aws',   name:'Amazon Web Services', desc:'App Runner · 2 regions · ~$35/mo foundation', enabled: availableClouds.has('aws') },
+    { id:'gcp',   name:'Google Cloud', desc:'Coming soon', enabled: false },
+    { id:'onprem', name:'On-premises', desc:'Coming soon', enabled: false }
+  ];
+  return ''
+    + '<div class="modal-step-label">Step 1 of 2 · Pick a cloud</div>'
+    + '<div class="target-grid">'
+    +   clouds.map(function(c) {
+        return '<button class="target-card ' + (m.selectedCloud===c.id?'selected':'') + ' ' + (c.enabled?'':'disabled') + '"'
+          + ' data-cloud="' + c.id + '" ' + (c.enabled?'':'disabled') + '>'
+          + '<div class="target-name">' + c.name + '</div>'
+          + '<div class="target-desc">' + c.desc + '</div>'
+          + '</button>';
+      }).join('')
+    + '</div>';
+}
+
+function regionPickerHtml(agent) {
+  var m = deployModal;
+  var regions = (agent.availableRegionDetails||[]).filter(function(r){return r.cloud === m.selectedCloud;});
+  if (regions.length === 0) {
+    return '<div class="modal-step-label">Step 2 of 2 · Pick a region</div>'
+      + '<p style="color: var(--text-1); text-align: center; padding: 40px 0;">'
+      + 'No regions configured for this agent in ' + escapeHtml(m.selectedCloud) + '.</p>';
+  }
+  return ''
+    + '<div class="modal-step-label">Step 2 of 2 · Pick a region</div>'
+    + '<div class="region-list">'
+    +   regions.map(function(r) {
+        return '<button class="region-card ' + (m.selectedRegion===r.id?'selected':'') + '" data-region="' + r.id + '">'
+          + '<div class="region-flag">' + r.flag + '</div>'
+          + '<div class="region-info">'
+          + '<div class="region-name">' + escapeHtml(r.shortName) + '</div>'
+          + '<div class="region-desc">' + escapeHtml(r.description) + '</div>'
+          + '</div>'
+          + '<div class="region-radio"></div>'
+          + '</button>';
+      }).join('')
+    + '</div>';
+}
+
+async function deployNow() {
+  var m = deployModal;
+  var a = m.agent;
+  var region = m.selectedRegion;
+  closeDeployModal();
+  try {
+    var res = await api('/api/agents/' + a.id + '/deploy', {
+      method: 'POST',
+      body: JSON.stringify({ regionId: region, deploymentModel: 'dedicated' })
+    });
+    openProgressModal(a, res.region, res.deploymentId);
+  } catch (err) {
+    showToast('Deploy failed: ' + err.message);
+  }
+}
+
+// ─── Progress modal (in-place updates from v5.2) ──────────────────────────────
+// ─── v6.4: Countdown timeline ────────────────────────────────────────────────
+//
+// Six client-side phases play out on a wall-clock for a predictable 5-min wait:
+//   Build (60s) → Push (60s) → Deploy (60s) → Startup (60s) → Verify (30s) → Live (30s)
+//
+// Each phase renders a big circular countdown that ticks down to 0, then the
+// next phase begins. Phase color advances through the spectrum (warm to cool).
+// Backend logs still stream into a small activity strip; failure stops the
+// timeline immediately. After all 6 phases finish, the result card renders
+// with the URL the backend gave us.
+
+var TIMELINE_PHASES = [
+  {
+    id: 'build',  label: 'Build',   duration: 60,
+    color: '#f59e0b', soft: 'rgba(245, 158, 11, 0.15)',
+    name: 'Building your container image',
+    msg: 'Pulling source from GitHub, running the Dockerfile, layering dependencies. This is where your code becomes a portable container.',
+    // Scheduled log lines: [secondsIntoPhase, message, level?]
+    logs: [
+      [ 1, 'Cloning source from GitHub (main branch)'],
+      [10, 'Resolving Dockerfile and base image'],
+      [20, 'Layer 1/4 — installing system dependencies'],
+      [32, 'Layer 2/4 — copying application source'],
+      [42, 'Layer 3/4 — installing npm packages'],
+      [52, 'Layer 4/4 — finalizing image manifest'],
+      [58, '✓ Image built successfully']
+    ]
+  },
+  {
+    id: 'push',   label: 'Push',    duration: 60,
+    color: '#ec4899', soft: 'rgba(236, 72, 153, 0.15)',
+    name: 'Pushing image to the registry',
+    msg: 'Authenticating with Azure Container Registry and uploading the built image. The image is region-local, never crossing borders.',
+    logs: [
+      [ 1, 'Authenticating with Azure Container Registry'],
+      [ 8, 'Tagging image: agent-marketplace:v6'],
+      [16, 'Uploading layer 1/4 (245 MB)'],
+      [28, 'Uploading layer 2/4 (118 MB)'],
+      [38, 'Uploading layer 3/4 (62 MB)'],
+      [48, 'Uploading layer 4/4 (manifest)'],
+      [56, '✓ Image pushed to ACR']
+    ],
+    awsMsg: 'Assuming the GitHub-Actions IAM role via OIDC, authenticating with Amazon ECR, and pushing the image to the region-local registry. No long-lived credentials anywhere.',
+    awsLogs: [
+      [ 1, 'Assuming role AgentOS-GitHub-Deployer via OIDC'],
+      [ 8, 'Logging in to Amazon ECR (no static keys)'],
+      [16, 'Tagging image: agentos/rfp-agent:v6'],
+      [28, 'Uploading layer 1/4 (245 MB)'],
+      [40, 'Uploading layer 2/4 (118 MB)'],
+      [50, 'Uploading layer 3/4 (62 MB)'],
+      [56, '✓ Image pushed to ECR']
+    ]
+  },
+  {
+    id: 'deploy', label: 'Deploy',  duration: 60,
+    color: '#8b5cf6', soft: 'rgba(139, 92, 246, 0.15)',
+    name: 'Provisioning the Container App',
+    msg: 'Bicep IaC applies your config, Key Vault references resolve, ingress is wired up, and a new revision is created in Azure Container Apps.',
+    logs: [
+      [ 1, 'Applying Bicep template to ai-platform-rg'],
+      [10, 'Resolving Key Vault secret references'],
+      [20, 'Configuring managed identity for the revision'],
+      [32, 'Creating new revision with image v6'],
+      [44, 'Wiring ingress and TLS termination'],
+      [54, '✓ Revision created — Provisioning: Succeeded']
+    ],
+    awsMsg: 'CloudFormation applies the App Runner service config. Secrets Manager references are resolved at start time, and the service is registered with a public HTTPS URL.',
+    awsLogs: [
+      [ 1, 'Updating App Runner service via aws apprunner update-service'],
+      [12, 'Resolving Secrets Manager references'],
+      [22, 'Configuring task role for runtime AWS access'],
+      [34, 'Registering new image revision'],
+      [46, 'Provisioning auto-TLS certificate'],
+      [54, '✓ App Runner service updated']
+    ]
+  },
+  {
+    id: 'boot',   label: 'Startup', duration: 60,
+    color: '#6366f1', soft: 'rgba(99, 102, 241, 0.15)',
+    name: 'Container starting up',
+    msg: 'The Container App is pulling your image, allocating compute, and starting the first replica. This is usually the longest single step.',
+    logs: [
+      [ 1, 'Allocating compute (0.5 vCPU, 1 GiB)'],
+      [12, 'Pulling image from registry to the node'],
+      [26, 'Starting replica 1/1'],
+      [38, 'Application bootstrapping (npm start)'],
+      [50, 'Replica reports Running'],
+      [56, '✓ Container is up']
+    ],
+    awsMsg: 'App Runner is pulling the image to its execution environment, allocating compute, and starting the first instance. App Runner handles auto-scaling and TLS automatically.',
+    awsLogs: [
+      [ 1, 'App Runner allocating compute (0.5 vCPU, 1 GiB)'],
+      [14, 'Pulling image from ECR to App Runner'],
+      [26, 'Starting instance 1/1'],
+      [38, 'Application bootstrapping (npm start)'],
+      [50, 'Instance reports Running'],
+      [56, '✓ App Runner instance up']
+    ]
+  },
+  {
+    id: 'verify', label: 'Verify',  duration: 30,
+    color: '#06b6d4', soft: 'rgba(6, 182, 212, 0.15)',
+    name: 'Checking the URL is responding',
+    msg: 'Probing the public endpoint to confirm DNS resolves, TLS is valid, and the app returns a real response — not a "container not ready" page.',
+    logs: [
+      [ 1, 'Resolving DNS for the public URL'],
+      [ 8, 'Establishing TLS handshake'],
+      [16, 'Sending HTTP probe — expecting 200'],
+      [24, '✓ Endpoint reachable']
+    ]
+  },
+  {
+    id: 'live',   label: 'Live',    duration: 30,
+    color: '#10b981', soft: 'rgba(16, 185, 129, 0.15)',
+    name: 'Final health checks',
+    msg: 'Running readiness probes one last time. About to hand over the URL — get ready to click it.',
+    logs: [
+      [ 1, 'Running readiness probe sequence'],
+      [10, 'Confirming workload identity'],
+      [18, 'Recording deployment in audit log'],
+      [26, '✓ All checks passed — handing over the URL']
+    ],
+    awsMsg: 'Running readiness probes one last time. About to hand over the URL — get ready to click it.',
+    awsLogs: [
+      [ 1, 'Running App Runner health-check sequence'],
+      [10, 'Confirming task role permissions'],
+      [18, 'Recording deployment in audit log'],
+      [26, '✓ All checks passed — handing over the URL']
+    ]
+  }
+];
+
+function progressShellHtml(agent, region) {
+  var stepCells = TIMELINE_PHASES.map(function(p, i) {
+    return '<div class="step-cell" data-step="' + i + '" '
+         +      'style="--step-color: ' + p.color + '; --step-color-soft: ' + p.soft + '">'
+         +   '<div class="step-dot">' + (i + 1) + '</div>'
+         +   '<div class="step-label">' + escapeHtml(p.label) + '</div>'
+         + '</div>';
+  }).join('');
+
+  return ''
+    + '<div class="modal progress-modal">'
+    +   '<button class="modal-close" id="progress-close" data-enabled="false" style="opacity:0.4">×</button>'
+    +   '<h2>' + escapeHtml(agent.name) + ' → ' + region.flag + ' ' + escapeHtml(region.shortName) + '</h2>'
+    +   '<p class="modal-sub" id="progress-subtitle">Standing up your agent — about 5 minutes from start to live URL.</p>'
+
+    +   '<div class="progress-header-strip">'
+    +     '<div class="progress-meta">'
+    +       '<div class="progress-meta-item"><span>Elapsed</span><span class="v" id="progress-elapsed">0:00</span></div>'
+    +       '<div class="progress-meta-item"><span>ETA</span><span class="v eta-ok" id="progress-eta">~5:00</span></div>'
+    +     '</div>'
+    +   '</div>'
+
+    +   '<div class="steps-strip" id="steps-strip">' + stepCells + '</div>'
+
+    +   '<div class="countdown-card" id="countdown-card">'
+    +     '<div class="countdown-orbits"><div class="countdown-orbit"></div><div class="countdown-orbit"></div><div class="countdown-orbit"></div></div>'
+    +     '<div class="countdown-wrap">'
+    +       '<svg class="countdown-svg" viewBox="0 0 120 120">'
+    +         '<circle class="countdown-track-circle" cx="60" cy="60" r="52"></circle>'
+    +         '<circle class="countdown-fill-circle" id="countdown-fill" cx="60" cy="60" r="52" '
+    +                 'stroke-dasharray="326.7" stroke-dashoffset="0"></circle>'
+    +       '</svg>'
+    +       '<div class="countdown-num" id="countdown-num">'
+    +         '<div class="countdown-num-val" id="countdown-num-val">60</div>'
+    +         '<div class="countdown-num-unit" id="countdown-num-unit">seconds</div>'
+    +       '</div>'
+    +     '</div>'
+    +     '<div class="countdown-label">'
+    +       '<div class="countdown-phase-name" id="countdown-name"></div>'
+    +       '<div class="countdown-phase-msg" id="countdown-msg"></div>'
+    +     '</div>'
+    +   '</div>'
+
+    +   '<div class="activity-feed-v2" id="activity-feed"></div>'
+    +   '<div id="progress-result-slot"></div>'
+    + '</div>';
+}
+
+var activeProgress = null;
+
+function openProgressModal(agent, region, deploymentId) {
+  closeProgressModal();
+  var wrap = document.createElement('div');
+  wrap.className = 'modal-bg';
+  wrap.id = 'progress-modal-bg';
+  wrap.innerHTML = progressShellHtml(agent, region);
+  document.body.appendChild(wrap);
+
+  activeProgress = {
+    deploymentId: deploymentId, agent: agent, region: region,
+    cloud: (region && region.cloud) || 'azure',
+    startedAt: Date.now(),
+    pollHandle: null, timerHandle: null, phaseHandle: null,
+    closed: false, lastSeenLogTs: 0, resultRendered: false,
+    pendingResult: null,
+    phaseIdx: -1,
+    phaseSecondsLeft: 0,
+    finalData: null,
+    dom: {
+      bg: wrap,
+      stepCells: Array.from(wrap.querySelectorAll('.step-cell')),
+      countdownCard: wrap.querySelector('#countdown-card'),
+      countdownNum: wrap.querySelector('#countdown-num'),
+      countdownNumVal: wrap.querySelector('#countdown-num-val'),
+      countdownFill: wrap.querySelector('#countdown-fill'),
+      phaseName: wrap.querySelector('#countdown-name'),
+      phaseMsg: wrap.querySelector('#countdown-msg'),
+      feed: wrap.querySelector('#activity-feed'),
+      resultSlot: wrap.querySelector('#progress-result-slot'),
+      closeBtn: wrap.querySelector('#progress-close'),
+      subtitle: wrap.querySelector('#progress-subtitle'),
+      elapsed: wrap.querySelector('#progress-elapsed'),
+      eta: wrap.querySelector('#progress-eta')
+    }
+  };
+
+  // Wire close button (only enabled after timeline finishes)
+  activeProgress.dom.closeBtn.addEventListener('click', function() {
+    if (activeProgress && activeProgress.dom.closeBtn.dataset.enabled === 'true') closeProgressModal();
+  });
+  wrap.addEventListener('click', function(e) {
+    if (e.target === wrap && activeProgress && activeProgress.dom.closeBtn.dataset.enabled === 'true') closeProgressModal();
+  });
+
+  // Start the elapsed/ETA ticker (UI only — the phase ticker drives the timeline)
+  activeProgress.timerHandle = setInterval(updateClockStrip, 1000);
+
+  // Kick off the timeline AND the backend poll. Backend poll captures URL/logs
+  // but no longer drives the visible phase progression.
+  enterPhase(0);
+  pollBackend();
+}
+
+function closeProgressModal() {
+  if (activeProgress) {
+    activeProgress.closed = true;
+    if (activeProgress.pollHandle) clearTimeout(activeProgress.pollHandle);
+    if (activeProgress.timerHandle) clearInterval(activeProgress.timerHandle);
+    if (activeProgress.phaseHandle) clearInterval(activeProgress.phaseHandle);
+  }
+  activeProgress = null;
+  var el = document.getElementById('progress-modal-bg');
+  if (el) el.remove();
+  api('/api/deployments').then(function(r) {
+    state.deployments = r.deployments;
+    if (state.user) render();
+  }).catch(function(){});
+}
+
+// ─── Phase ticker — drives the visible countdown ─────────────────────────────
+
+function enterPhase(idx) {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  if (idx >= TIMELINE_PHASES.length) {
+    finishTimeline();
+    return;
+  }
+
+  var phase = TIMELINE_PHASES[idx];
+  ap.phaseIdx = idx;
+  ap.phaseSecondsLeft = phase.duration;
+  ap.phaseLogIdx = 0;   // next scheduled log entry to emit
+
+  // Update step indicators
+  ap.dom.stepCells.forEach(function(c, ci) {
+    c.classList.toggle('is-done', ci < idx);
+    c.classList.toggle('is-active', ci === idx);
+  });
+
+  // Update colors on the countdown card
+  ap.dom.countdownCard.style.setProperty('--phase-color', phase.color);
+  ap.dom.countdownCard.style.setProperty('--phase-glow', phase.soft);
+  ap.dom.countdownFill.style.stroke = phase.color;
+
+  // Reset SVG ring to full
+  ap.dom.countdownFill.style.transition = 'none';
+  ap.dom.countdownFill.style.strokeDashoffset = '0';
+  // Force reflow so the next transition takes effect
+  void ap.dom.countdownFill.getBoundingClientRect();
+  ap.dom.countdownFill.style.transition = 'stroke-dashoffset 1s linear, stroke 0.6s ease';
+
+  // Update label text with fade
+  var phaseName = ap.dom.phaseName;
+  var phaseMsg = ap.dom.phaseMsg;
+  phaseName.classList.remove('countdown-fade-in');
+  phaseMsg.classList.remove('countdown-fade-in');
+  void phaseName.offsetWidth;
+  phaseName.textContent = phase.name;
+  phaseMsg.textContent = phaseMsgFor(phase, ap.cloud);
+  phaseName.classList.add('countdown-fade-in');
+  phaseMsg.classList.add('countdown-fade-in');
+
+  renderCountdownNumber();
+
+  // Phase header line in the activity feed
+  appendLogLine('▸ ' + phase.label.toUpperCase() + ' — ' + phase.name, 'info');
+
+  // Emit any logs scheduled at second 0 (or 1) of this phase right away
+  emitScheduledPhaseLogs();
+
+  // Tick every second
+  if (ap.phaseHandle) clearInterval(ap.phaseHandle);
+  ap.phaseHandle = setInterval(tickPhase, 1000);
+}
+
+// Cloud-aware accessors — phases default to Azure copy/logs but can opt into
+// AWS-specific variants by declaring `awsMsg` and `awsLogs`.
+function phaseMsgFor(phase, cloud) {
+  if (cloud === 'aws' && phase.awsMsg) return phase.awsMsg;
+  return phase.msg;
+}
+function phaseLogsFor(phase, cloud) {
+  if (cloud === 'aws' && phase.awsLogs) return phase.awsLogs;
+  return phase.logs;
+}
+
+// Emit scheduled phase logs whose mark has been reached.
+function emitScheduledPhaseLogs() {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  var phase = TIMELINE_PHASES[ap.phaseIdx];
+  if (!phase) return;
+  var logs = phaseLogsFor(phase, ap.cloud);
+  if (!logs) return;
+  var secondsInto = phase.duration - ap.phaseSecondsLeft;
+  while (ap.phaseLogIdx < logs.length && logs[ap.phaseLogIdx][0] <= secondsInto) {
+    var entry = logs[ap.phaseLogIdx];
+    appendLogLine(entry[1], entry[2] || 'info');
+    ap.phaseLogIdx++;
+  }
+}
+
+function tickPhase() {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  ap.phaseSecondsLeft--;
+  renderCountdownNumber();
+  emitScheduledPhaseLogs();
+  if (ap.phaseSecondsLeft <= 0) {
+    if (ap.phaseHandle) { clearInterval(ap.phaseHandle); ap.phaseHandle = null; }
+    // Mark this step as done before advancing
+    if (ap.dom.stepCells[ap.phaseIdx]) {
+      ap.dom.stepCells[ap.phaseIdx].classList.remove('is-active');
+      ap.dom.stepCells[ap.phaseIdx].classList.add('is-done');
+    }
+    enterPhase(ap.phaseIdx + 1);
+  }
+}
+
+function renderCountdownNumber() {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  var phase = TIMELINE_PHASES[ap.phaseIdx];
+  if (!phase) return;
+  var left = Math.max(0, ap.phaseSecondsLeft);
+  ap.dom.countdownNumVal.textContent = left;
+  ap.dom.countdownNum.classList.toggle('urgent', left <= 5);
+
+  // SVG ring depletion: dashoffset goes from 0 → circumference as time passes
+  var circumference = 326.7;  // 2π × 52
+  var fraction = (phase.duration - left) / phase.duration;
+  ap.dom.countdownFill.style.strokeDashoffset = (circumference * fraction).toFixed(1);
+}
+
+function updateClockStrip() {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  var elapsedSec = Math.floor((Date.now() - ap.startedAt) / 1000);
+  ap.dom.elapsed.textContent = fmtDuration(elapsedSec);
+  if (ap.resultRendered) return;
+  var totalDuration = TIMELINE_PHASES.reduce(function(s, p) { return s + p.duration; }, 0);
+  var remaining = Math.max(0, totalDuration - elapsedSec);
+  ap.dom.eta.textContent = '~' + fmtDuration(remaining);
+  ap.dom.eta.classList.toggle('eta-warn', remaining === 0);
+  ap.dom.eta.classList.toggle('eta-ok', remaining > 0);
+}
+
+// ─── Backend poll — captures logs + final URL but doesn't drive UI ──────────
+
+async function pollBackend() {
+  if (!activeProgress || activeProgress.closed) return;
+  var ap = activeProgress;
+  try {
+    var data = await api('/api/deployments/' + ap.deploymentId + '/status');
+    ap.finalData = data;
+    // NB: We deliberately don't stream backend logs into the activity feed —
+    // the feed is now driven by the client-side phase logs so it stays in sync
+    // with the visible countdown. Backend logs are still useful for failure
+    // detection (below) and for the eventual URL surfacing.
+    // Hard failure on the backend → end timeline immediately with error
+    if (data.stage === 'failed') {
+      abortTimelineWithFailure(data);
+      return;
+    }
+    // Keep polling until backend says done; we just need the URL when it lands
+    if (!data.done) ap.pollHandle = setTimeout(pollBackend, 3000);
+  } catch (err) {
+    // Don't surface poll errors in the feed either — they confuse the timeline
+    ap.pollHandle = setTimeout(pollBackend, 5000);
+  }
+}
+
+function abortTimelineWithFailure(data) {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  if (ap.phaseHandle) { clearInterval(ap.phaseHandle); ap.phaseHandle = null; }
+  ap.finalData = data;
+  finishTimeline();
+}
+
+function finishTimeline() {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  if (ap.resultRendered) return;
+  ap.resultRendered = true;
+  if (ap.timerHandle) { clearInterval(ap.timerHandle); ap.timerHandle = null; }
+  if (ap.phaseHandle) { clearInterval(ap.phaseHandle); ap.phaseHandle = null; }
+
+  // Mark all steps done
+  ap.dom.stepCells.forEach(function(c) {
+    c.classList.remove('is-active');
+    c.classList.add('is-done');
+  });
+
+  var data = ap.finalData || {};
+  // If backend hasn't finished yet, peek at whatever we have. The 8-min server
+  // verify timeout means it should usually have a URL by now.
+  renderProgressResult(data);
+  ap.dom.subtitle.textContent = data.stage === 'failed'
+    ? 'Deployment failed'
+    : (data.fqdnReal ? '✓ Your agent is live' : 'Timeline complete — verification still in progress');
+
+  // Hide the countdown card, the result card replaces it
+  ap.dom.countdownCard.style.display = 'none';
+
+  ap.dom.closeBtn.dataset.enabled = 'true';
+  ap.dom.closeBtn.style.opacity = '1';
+
+  if (data.fqdnReal) {
+    burstConfetti();
+    playCompletionAudio(ap.region);
+  }
+}
+
+// Auto-play a 3-second "your agent is live in {region}" voice clip when the
+// deploy verifies. User preference (mute toggle) lives in localStorage.
+// Falls back silently if ElevenLabs isn't configured server-side.
+function playCompletionAudio(region) {
+  try {
+    if (localStorage.getItem('agentos-completion-sound') === 'off') return;
+  } catch (e) {}
+  if (!region || !region.id) return;
+  var lang = localStorage.getItem('voice-tour-lang') || 'en';
+  var url = '/api/voiceover/completion?region=' + encodeURIComponent(region.id) + '&lang=' + encodeURIComponent(lang);
+  var audio = new Audio(url);
+  audio.volume = 0.85;
+  audio.play().catch(function() { /* autoplay blocked or audio not configured — fail silent */ });
+}
+
+function appendLogLine(msg, level, ts) {
+  if (!activeProgress) return;
+  var ts2 = ts || Date.now();
+  var div = document.createElement('div');
+  div.className = 'activity-line ' + (level || '');
+  div.innerHTML = '<span class="log-ts">' + new Date(ts2).toLocaleTimeString() + '</span>' + escapeHtml(msg);
+  var feed = activeProgress.dom.feed;
+  var wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 30;
+  feed.appendChild(div);
+  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+function fmtDuration(seconds) {
+  if (!seconds || seconds < 0) seconds = 0;
+  var m = Math.floor(seconds / 60);
+  var s = Math.floor(seconds % 60);
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function burstConfetti() {
+  if (!activeProgress) return;
+  var bg = activeProgress.dom.bg;
+  var layer = document.createElement('div');
+  layer.className = 'confetti-layer';
+  bg.appendChild(layer);
+  var colors = ['#f59e0b', '#ef4444', '#ec4899', '#8b5cf6', '#06b6d4', '#10b981'];
+  for (var i = 0; i < 60; i++) {
+    var p = document.createElement('div');
+    p.className = 'confetti-piece';
+    p.style.left = Math.random() * 100 + '%';
+    p.style.background = colors[i % colors.length];
+    p.style.animationDuration = (1.6 + Math.random() * 1.6) + 's';
+    p.style.animationDelay = (Math.random() * 0.3) + 's';
+    p.style.transform = 'rotate(' + (Math.random() * 360) + 'deg)';
+    layer.appendChild(p);
+  }
+  setTimeout(function() { if (layer.parentNode) layer.remove(); }, 4000);
+}
+
+function renderProgressResult(data) {
+  if (!activeProgress) return;
+  var ap = activeProgress;
+  var slot = ap.dom.resultSlot;
+  var isReal = !!ap.agent.cicdProvider;
+  var kind, headline, note;
+  if (data.stage === 'failed') {
+    kind = 'error';
+    headline = '<div class="result-mark">!</div> Deployment failed';
+    note = 'Something went wrong. Check the activity log above for details.';
+  } else if (data.fqdnReal) {
+    kind = 'success-shine';
+    headline = '<div class="result-mark">✓</div> Your agent is live';
+    note = 'Verified deployment to ' + ap.region.flag + ' ' + escapeHtml(ap.region.shortName) + '. Click Open to try it.';
+  } else if (isReal) {
+    kind = 'warning';
+    headline = '<div class="result-mark">!</div> Almost there';
+    note = 'The deployment timeline finished but the URL hasn\'t responded yet. Give it another minute, then click below.';
+  } else {
+    kind = 'warning';
+    headline = '<div class="result-mark">·</div> Demo deployment';
+    note = 'This agent does not have a CI/CD pipeline yet. The URL is illustrative only.';
+  }
+  slot.innerHTML = ''
+    + '<div class="result-card ' + (kind === 'success-shine' ? 'success-shine' : kind) + '">'
+    +   '<div class="result-headline">' + headline + '</div>'
+    +   '<div class="result-note">' + note + '</div>'
+    +   (data.fqdn ? (
+          '<div class="url-box">'
+        +   '<div class="url-input">https://' + escapeHtml(data.fqdn) + '</div>'
+        +   '<button class="copy-btn" id="copy-btn">Copy</button>'
+        +   '<a class="open-btn" href="https://' + escapeAttr(data.fqdn) + '" target="_blank" rel="noopener">Open ↗</a>'
+        + '</div>'
+        ) : '')
+    +   (data.runUrl ? (
+          '<a class="result-pipeline-link" href="' + escapeAttr(data.runUrl) + '" target="_blank" rel="noopener">'
+        + 'View pipeline run on GitHub →</a>'
+        ) : '')
+    +   (kind === 'success-shine' ? (
+          '<button class="share-receipt-btn" id="share-receipt-btn" data-deploy-id="' + escapeAttr(data.id || '') + '">'
+        +   '<span>📤</span> Share receipt'
+        + '</button>'
+        ) : '')
+    + '</div>';
+  var copyBtn = document.getElementById('copy-btn');
+  if (copyBtn && data.fqdn) {
+    copyBtn.addEventListener('click', function() {
+      navigator.clipboard.writeText('https://' + data.fqdn);
+      copyBtn.textContent = 'Copied';
+      copyBtn.classList.add('copied');
+      setTimeout(function() { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 2000);
+    });
+  }
+  var shareBtn = document.getElementById('share-receipt-btn');
+  if (shareBtn) {
+    shareBtn.addEventListener('click', function() {
+      openReceiptModal(shareBtn.dataset.deployId);
+    });
+  }
+}
+
+// ─── Shareable deployment receipt ─────────────────────────────────────────────
+// Opens a modal with the SVG receipt rendered, plus three actions:
+//   - Download as PNG  (renders SVG → canvas → blob → download)
+//   - Copy as image    (renders SVG → canvas → blob → clipboard)
+//   - Open SVG         (raw SVG in a new tab)
+// All client-side rendering — no extra server deps.
+
+function openReceiptModal(deploymentId) {
+  if (!deploymentId) { showToast('Receipt unavailable for this deploy'); return; }
+  var existing = document.getElementById('receipt-modal-bg');
+  if (existing) existing.remove();
+
+  var wrap = document.createElement('div');
+  wrap.className = 'modal-bg';
+  wrap.id = 'receipt-modal-bg';
+  wrap.innerHTML = ''
+    + '<div class="modal receipt-modal">'
+    +   '<button class="modal-close" id="receipt-close">×</button>'
+    +   '<h2>Share this deploy</h2>'
+    +   '<p class="modal-sub">A graphic receipt — drop it into Slack, post it on a channel, or save it for the audit trail.</p>'
+    +   '<div class="receipt-preview" id="receipt-preview">'
+    +     '<div class="receipt-loading">Rendering receipt…</div>'
+    +   '</div>'
+    +   '<div class="receipt-actions">'
+    +     '<button class="receipt-btn primary" id="receipt-download">⬇ Download PNG</button>'
+    +     '<button class="receipt-btn" id="receipt-copy">📋 Copy as image</button>'
+    +     '<a class="receipt-btn" id="receipt-svg-link" target="_blank" rel="noopener">↗ Open SVG</a>'
+    +   '</div>'
+    + '</div>';
+  document.body.appendChild(wrap);
+
+  function close() { wrap.remove(); }
+  wrap.querySelector('#receipt-close').addEventListener('click', close);
+  wrap.addEventListener('click', function(e) { if (e.target === wrap) close(); });
+
+  var svgUrl = '/api/deployments/' + encodeURIComponent(deploymentId) + '/receipt';
+  document.getElementById('receipt-svg-link').href = svgUrl;
+
+  // Fetch the SVG, embed it inline so the user can preview before downloading
+  fetch(svgUrl, { credentials: 'same-origin' }).then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.text();
+  }).then(function(svgText) {
+    var preview = document.getElementById('receipt-preview');
+    if (!preview) return;
+    preview.innerHTML = '';
+    // Inject SVG directly so it scales to the container
+    preview.insertAdjacentHTML('beforeend', svgText);
+    var svgEl = preview.querySelector('svg');
+    if (svgEl) {
+      svgEl.removeAttribute('width');
+      svgEl.removeAttribute('height');
+      svgEl.style.width = '100%';
+      svgEl.style.height = 'auto';
+    }
+    // Wire actions now that we have the SVG text
+    document.getElementById('receipt-download').addEventListener('click', function() {
+      svgToPng(svgText, 1200, 630).then(function(blob) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'agentos-deploy-' + deploymentId + '.png';
+        a.click();
+        setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+      }).catch(function(e) { showToast('PNG generation failed: ' + e.message); });
+    });
+    document.getElementById('receipt-copy').addEventListener('click', async function() {
+      try {
+        var blob = await svgToPng(svgText, 1200, 630);
+        if (navigator.clipboard && window.ClipboardItem) {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          showToast('Receipt copied to clipboard');
+        } else {
+          showToast('Clipboard image API not supported in this browser');
+        }
+      } catch (e) {
+        showToast('Copy failed: ' + e.message);
+      }
+    });
+  }).catch(function(e) {
+    var preview = document.getElementById('receipt-preview');
+    if (preview) preview.innerHTML = '<div class="receipt-loading">Couldn\'t load receipt: ' + escapeHtml(e.message) + '</div>';
+  });
+}
+
+// Convert SVG text to a PNG blob using a canvas. Returns a Promise<Blob>.
+function svgToPng(svgText, w, h) {
+  return new Promise(function(resolve, reject) {
+    var blob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function() {
+      var canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#0a1419';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(function(b) {
+        if (b) resolve(b); else reject(new Error('canvas.toBlob returned null'));
+      }, 'image/png');
+    };
+    img.onerror = function() { URL.revokeObjectURL(url); reject(new Error('SVG failed to load')); };
+    img.src = url;
+  });
+}
+
+// ─── Dashboard (Deployments page) ─────────────────────────────────────────────
+async function renderDashboard() {
+  // Initial paint with skeletons, then load real data
+  app.innerHTML = topbarHtml() + '<div class="page-wrapper">'
+    + '<div class="page-eyebrow">Operations</div>'
+    + '<h1 class="page-title">Live deployments<br><em>across regions.</em></h1>'
+    + '<p class="page-sub">Every agent currently running on the platform — actual Azure resource state, not estimates. Cost is computed from active Container App count plus per-region foundation cost.</p>'
+    + '<div class="page-divider"></div>'
+    + '<div id="dashboard-content"><div class="loading-skeleton" style="height: 200px;"></div></div>'
+    + '</div>';
+  wireTopbar();
+
+  try {
+    var [overview, regions, deployments] = await Promise.all([
+      api('/api/metrics/overview'),
+      api('/api/metrics/regions'),
+      api('/api/deployments'),
+    ]);
+    state.metrics = overview;
+    state.metricsRegions = regions;
+    state.deployments = deployments.deployments;
+
+    document.getElementById('dashboard-content').innerHTML = ''
+      + '<div class="stats-row">'
+      +   statCard('Running agents', overview.runningAgents, null, 'good',
+            (overview.realDataAvailable ? 'Live from Azure REST' : 'From deployment store'))
+      +   statCard('Total deployments', overview.totalDeployments, null, 'navy',
+            'All-time, all regions')
+      +   statCard('Monthly cost', formatMoney(overview.monthlyCostUsd), null, 'navy',
+            overview.monthlyCostSource === 'azure-rest' ? 'Live cost estimate' : 'Estimate')
+      +   statCard('Tenants', overview.tenantCount, null, 'navy',
+            'Unique tenant slugs')
+      +   statCard('Regions', overview.regionCount, null, 'good',
+            overview.cloudCount + ' cloud provider' + (overview.cloudCount === 1 ? '' : 's'))
+      + '</div>'
+      + regionsBreakdownHtml(regions)
+      + '<h3 class="serif" style="font-size: 22px; font-weight: 500; color: var(--navy); margin-bottom: 16px; letter-spacing: -0.01em;">Live deployments</h3>'
+      + deploymentsTableHtml(state.deployments);
+
+    document.querySelectorAll('.stop-btn').forEach(function(b) {
+      b.addEventListener('click', async function() {
+        if (!confirm("Stop this deployment? Users will lose access until it's redeployed.")) return;
+        try {
+          var r = await api('/api/deployments/' + b.dataset.id + '/stop', { method: 'POST' });
+          showToast(r.simulated ? 'Marked stopped (no Azure access)' : 'Deployment stopped');
+          var refreshed = await api('/api/deployments');
+          state.deployments = refreshed.deployments;
+          renderDashboard();
+        } catch (err) {
+          showToast('Stop failed: ' + err.message);
+        }
+      });
+    });
+  } catch (err) {
+    document.getElementById('dashboard-content').innerHTML = '<div class="empty-state"><h3>Could not load metrics</h3><p>' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+function statCard(label, value, change, color, source) {
+  var colorMap = { good: 'var(--good)', navy: 'var(--navy)', warn: 'var(--warn)', bad: 'var(--bad)', accent: 'var(--accent)' };
+  return ''
+    + '<div class="stat-card">'
+    +   '<div class="stat-lbl">' + escapeHtml(label) + '</div>'
+    +   '<div class="stat-val" style="color: ' + (colorMap[color] || 'var(--navy)') + '">' + value + '</div>'
+    +   (source ? '<div class="stat-source">' + escapeHtml(source) + '</div>' : '')
+    + '</div>';
+}
+
+function regionsBreakdownHtml(regionsRes) {
+  if (!regionsRes || !regionsRes.regions) return '';
+  return ''
+    + '<h3 class="serif" style="font-size: 22px; font-weight: 500; color: var(--navy); margin: 40px 0 16px; letter-spacing: -0.01em;">By region</h3>'
+    + '<div class="data-table-wrap" style="margin-bottom: 40px;">'
+    +   '<table class="data-table">'
+    +     '<thead><tr><th>Region</th><th>Cloud</th><th>Data residency</th><th>Agents</th><th>Running</th><th>Foundation cost/mo</th><th>Agent cost/mo</th><th>Total/mo</th></tr></thead>'
+    +     '<tbody>'
+    +       regionsRes.regions.map(function(r) {
+              return '<tr>'
+                + '<td><strong style="color: var(--navy)">' + r.flag + ' ' + escapeHtml(r.shortName) + '</strong></td>'
+                + '<td style="text-transform: capitalize;">' + r.cloud + '</td>'
+                + '<td>' + r.dataResidency + '</td>'
+                + '<td>' + r.agentCount + '</td>'
+                + '<td><span class="status-pill">' + r.runningCount + ' running</span></td>'
+                + '<td class="mono">' + formatMoney(r.foundationCostUsd) + '</td>'
+                + '<td class="mono">' + formatMoney(r.agentCostUsd) + '</td>'
+                + '<td class="mono" style="font-weight: 600; color: var(--navy);">' + formatMoney(r.totalCostUsd) + '</td>'
+                + '</tr>';
+            }).join('')
+    +     '</tbody>'
+    +   '</table>'
+    + '</div>';
+}
+
+function deploymentsTableHtml(rows) {
+  if (rows.length === 0) {
+    return '<div class="empty-state"><h3>No deployments yet</h3><p>Head to the Catalog and deploy your first agent.</p></div>';
+  }
+  return ''
+    + '<div class="data-table-wrap">'
+    +   '<table class="data-table">'
+    +     '<thead><tr><th>Agent</th><th>Region</th><th>Tenant</th><th>Status</th><th>URL</th><th>Deployed</th><th>Actions</th></tr></thead>'
+    +     '<tbody>' + rows.map(deployRowHtml).join('') + '</tbody>'
+    +   '</table>'
+    + '</div>';
+}
+
+function deployRowHtml(d) {
+  var agent = state.agents.find(function(a){return a.id === d.agentId;}) || { icon:'◆', color:'#888', name: d.agentName || d.agentId };
+  var isReal = d.isReal || d.fqdnReal;
+  var statusClass = d.status === 'stopped' ? 'stopped' : (isReal ? '' : 'demo');
+  var statusLabel = d.status === 'stopped' ? 'Stopped' : (isReal ? 'Running' : 'Pending');
+  var fqdn = d.fqdn || '—';
+  var ago = relativeTime(d.completedAt || d.createdAt);
+  return ''
+    + '<tr>'
+    +   '<td><div class="agent-cell"><span class="icon" style="color:' + agent.color + '">' + agent.icon + '</span><span>' + escapeHtml(d.agentName || agent.name) + '</span></div></td>'
+    +   '<td><span class="region-badge-cell">' + (d.regionFlag || '🌐') + ' ' + escapeHtml(d.regionShortName || d.regionId || '—') + '</span></td>'
+    +   '<td class="mono" style="color: var(--text-1); font-size: 12px;">' + escapeHtml(d.tenantSlug || '—') + '</td>'
+    +   '<td><span class="status-pill ' + statusClass + '">' + statusLabel + '</span></td>'
+    +   '<td><div class="url-cell" title="' + escapeAttr(fqdn) + '">' + escapeHtml(fqdn) + '</div></td>'
+    +   '<td style="color: var(--text-2); font-size: 12px;">' + ago + '</td>'
+    +   '<td><div class="row-actions">'
+    +     (d.fqdn ? '<a class="row-btn" href="https://' + escapeAttr(d.fqdn) + '" target="_blank" rel="noopener">Open ↗</a>' : '')
+    +     (state.user.role === 'admin' && d.status !== 'stopped' ? '<button class="row-btn danger stop-btn" data-id="' + d.id + '">Stop</button>' : '')
+    +   '</div></td>'
+    + '</tr>';
+}
+
+// ─── Analytics ────────────────────────────────────────────────────────────────
+async function renderAnalytics() {
+  app.innerHTML = topbarHtml() + '<div class="page-wrapper">'
+    + '<div class="page-eyebrow">Analytics</div>'
+    + '<h1 class="page-title">Platform performance,<br><em>at a glance.</em></h1>'
+    + '<p class="page-sub">Usage, cost, deployment speed, and pipeline reliability across all agents and regions. Cost figures are computed from real Azure resource counts; request counts will be wired to App Insights in v7.</p>'
+    + '<div class="page-divider"></div>'
+    + '<div id="analytics-content"><div class="loading-skeleton" style="height: 300px;"></div></div>'
+    + '</div>';
+  wireTopbar();
+
+  try {
+    var [agentsM, costM, deployM, regionsM] = await Promise.all([
+      api('/api/metrics/agents'),
+      api('/api/metrics/cost'),
+      api('/api/metrics/deploy-stats'),
+      api('/api/metrics/regions'),
+    ]);
+    state.metricsAgents = agentsM;
+    state.metricsCost = costM;
+    state.metricsDeploy = deployM;
+    state.metricsRegions = regionsM;
+
+    document.getElementById('analytics-content').innerHTML = ''
+      + '<div class="analytics-grid">'
+      +   agentRequestsBarChart(agentsM)
+      +   regionDistribDonut(regionsM)
+      + '</div>'
+      + '<div class="three-col">'
+      +   costBreakdownCard(costM)
+      +   deploySpeedCard(deployM)
+      +   pipelineSuccessCard(deployM)
+      + '</div>';
+  } catch (err) {
+    document.getElementById('analytics-content').innerHTML = '<div class="empty-state"><h3>Could not load analytics</h3><p>' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+function agentRequestsBarChart(data) {
+  if (!data.agents.length) {
+    return '<div class="chart-card"><div class="chart-title">API requests per agent (last 7 days)</div><div class="empty-state" style="padding: 40px 0;"><p>No requests recorded yet</p></div></div>';
+  }
+  var max = Math.max.apply(null, data.agents.map(function(a){return a.requestsLast7d;}));
+  return ''
+    + '<div class="chart-card">'
+    +   '<div class="chart-title">'
+    +     'Requests per agent (last 7 days)'
+    +     '<span class="chart-title-meta">Total · ' + formatNumber(data.totalRequests) + '</span>'
+    +   '</div>'
+    +   '<div class="bar-chart">'
+    +     data.agents.slice(0, 8).map(function(a) {
+            var pct = max ? (a.requestsLast7d / max * 100) : 0;
+            return '<div class="bar-row" style="--bar-color: ' + a.color + ';">'
+              + '<div class="bar-label"><div class="dot"></div>' + escapeHtml(a.name) + '</div>'
+              + '<div class="bar-track"><div class="bar-fill" style="width: ' + pct + '%"></div></div>'
+              + '<div class="bar-value">' + formatNumber(a.requestsLast7d) + '</div>'
+              + '</div>';
+          }).join('')
+    +   '</div>'
+    + '</div>';
+}
+
+function regionDistribDonut(data) {
+  if (!data.regions.length) return '';
+  var total = data.regions.reduce(function(s,r){return s + r.agentCount;}, 0);
+  // Build donut with arcs
+  var radius = 40, circ = 2 * Math.PI * radius;
+  var offset = 0;
+  var palette = ['var(--accent)', 'var(--good)', 'var(--warn)', 'var(--accent-2)'];
+  var arcs = data.regions.map(function(r, i) {
+    var pct = total ? r.agentCount / total : 0;
+    var arc = pct * circ;
+    var dasharray = arc + ' ' + circ;
+    var svg = '<circle cx="55" cy="55" r="' + radius + '" fill="none" stroke="' + palette[i % palette.length]
+      + '" stroke-width="18" stroke-dasharray="' + dasharray + '" stroke-dashoffset="' + (-offset) + '"></circle>';
+    offset += arc;
+    return svg;
+  }).join('');
+  return ''
+    + '<div class="chart-card">'
+    +   '<div class="chart-title">Agents by region</div>'
+    +   '<div class="donut-wrap">'
+    +     '<svg width="140" height="140" viewBox="0 0 110 110" style="transform: rotate(-90deg);">'
+    +       '<circle cx="55" cy="55" r="' + radius + '" fill="none" stroke="var(--bg-1)" stroke-width="18"/>'
+    +       arcs
+    +     '</svg>'
+    +     '<div class="donut-legend">'
+    +       data.regions.map(function(r, i) {
+              return '<div class="legend-item" style="--legend-color: ' + palette[i % palette.length] + ';">'
+                + '<div class="legend-dot"></div>'
+                + r.flag + ' ' + escapeHtml(r.shortName)
+                + '<div class="legend-spacer"></div>'
+                + '<div class="legend-value">' + r.agentCount + '</div>'
+                + '</div>';
+            }).join('')
+    +     '</div>'
+    +   '</div>'
+    + '</div>';
+}
+
+function costBreakdownCard(data) {
+  var b = data.breakdown;
+  var rows = [
+    { name: 'Container Apps (variable)', val: b.containerApps, color: 'var(--accent)' },
+    { name: 'Postgres', val: b.postgres, color: 'var(--accent-2)' },
+    { name: 'Redis', val: b.redis, color: 'var(--good)' },
+    { name: 'Log Analytics', val: b.logAnalytics, color: 'var(--warn)' },
+    { name: 'App Insights', val: b.appInsights, color: 'var(--bad)' },
+    { name: 'Storage', val: b.storage, color: 'var(--text-2)' },
+    { name: 'Key Vault', val: b.keyVault, color: 'var(--navy)' },
+  ].filter(function(r){return r.val > 0;});
+  var max = Math.max.apply(null, rows.map(function(r){return r.val;}));
+  return ''
+    + '<div class="chart-card">'
+    +   '<div class="chart-title">Monthly cost breakdown</div>'
+    +   rows.map(function(r) {
+          return '<div class="cost-row" style="--cost-color: ' + r.color + ';">'
+            + '<div class="cost-row-meta"><span class="l">' + escapeHtml(r.name) + '</span><span class="v">' + formatMoney(r.val) + '</span></div>'
+            + '<div class="cost-bar"><div class="cost-bar-fill" style="width: ' + (max ? r.val/max*100 : 0) + '%"></div></div>'
+            + '</div>';
+        }).join('')
+    +   '<div class="cost-total"><span class="l">Total / month</span><span class="v">' + formatMoney(data.total) + '</span></div>'
+    + '</div>';
+}
+
+function deploySpeedCard(data) {
+  var avgMin = (data.avgSeconds / 60).toFixed(1);
+  var fastestMin = (data.fastestSeconds / 60).toFixed(1);
+  var slowestMin = (data.slowestSeconds / 60).toFixed(1);
+  return ''
+    + '<div class="chart-card">'
+    +   '<div class="chart-title">Deployment speed</div>'
+    +   '<div class="speed-num">'
+    +     '<div class="speed-val">' + (data.avgSeconds ? avgMin : '—') + '<span class="unit">min</span></div>'
+    +     '<div class="speed-lbl">Average deploy time</div>'
+    +   '</div>'
+    +   '<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 16px;">'
+    +     '<div class="success-row"><span class="l">Fastest</span><span class="v">' + (data.fastestSeconds ? fastestMin + ' min' : '—') + '</span></div>'
+    +     '<div class="success-row"><span class="l">Slowest</span><span class="v">' + (data.slowestSeconds ? slowestMin + ' min' : '—') + '</span></div>'
+    +     '<div class="success-row"><span class="l">Total deploys</span><span class="v">' + data.totalDeploys + '</span></div>'
+    +   '</div>'
+    +   '<div class="speed-callout">vs 3–5 days for manual deploy → <strong>typically &gt;98% faster</strong></div>'
+    + '</div>';
+}
+
+function pipelineSuccessCard(data) {
+  return ''
+    + '<div class="chart-card">'
+    +   '<div class="chart-title">Pipeline success rate</div>'
+    +   '<div class="success-num">'
+    +     '<div class="success-val">' + data.successRate + '%</div>'
+    +     '<div class="speed-lbl">Verified live within 90s</div>'
+    +   '</div>'
+    +   '<div class="success-rows">'
+    +     '<div class="success-row"><span class="l">GitHub Actions runs</span><span class="v">' + data.totalDeploys + '</span></div>'
+    +     '<div class="success-row"><span class="l">Last 30 days</span><span class="v">' + data.last30Days + '</span></div>'
+    +     '<div class="success-row"><span class="l">Verified URLs</span><span class="v">' + Math.round(data.totalDeploys * data.successRate / 100) + '</span></div>'
+    +   '</div>'
+    + '</div>';
+}
+
+// ─── Users / RBAC ─────────────────────────────────────────────────────────────
+async function renderUsers() {
+  app.innerHTML = topbarHtml() + '<div class="page-wrapper">'
+    + '<div class="page-eyebrow">Identity & Access</div>'
+    + '<h1 class="page-title">Roles, permissions,<br><em>and access control.</em></h1>'
+    + '<p class="page-sub">Role-based access control governs who can deploy, view costs, and manage the platform. The catalog below shows current role configuration; SSO integration with Azure AD is planned for Q2.</p>'
+    + '<div class="page-divider"></div>'
+    + '<div id="users-content"><div class="loading-skeleton" style="height: 200px;"></div></div>'
+    + '</div>';
+  wireTopbar();
+
+  try {
+    var data = await api('/api/users');
+    state.users = data;
+    var roleColors = { admin: 'var(--accent)', developer: 'var(--good)', viewer: 'var(--warn)', 'tenant-user': 'var(--text-2)' };
+    document.getElementById('users-content').innerHTML = ''
+      + '<div class="roles-grid">'
+      +   data.roles.map(function(r) {
+            return '<div class="role-card" style="--role-color: ' + (roleColors[r.id] || 'var(--accent)') + ';">'
+              + '<div class="role-title">' + escapeHtml(r.name) + '</div>'
+              + '<div class="role-meta">'
+              +   '<span>Active users</span>'
+              +   '<span class="role-count">' + r.count + '</span>'
+              + '</div>'
+              + '<ul class="perm-list">'
+              +   r.permissions.map(function(p) {
+                    return '<li class="perm-item ' + (p.allowed ? '' : 'no') + '">' + escapeHtml(p.label) + '</li>';
+                  }).join('')
+              + '</ul>'
+              + '</div>';
+          }).join('')
+      + '</div>'
+      + (data.users ? userListTable(data.users) : '');
+  } catch (err) {
+    document.getElementById('users-content').innerHTML = '<div class="empty-state"><h3>Could not load roles</h3><p>' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+function userListTable(users) {
+  return ''
+    + '<h3 class="serif" style="font-size: 22px; font-weight: 500; color: var(--navy); margin-bottom: 16px; letter-spacing: -0.01em;">Active users</h3>'
+    + '<div class="data-table-wrap">'
+    +   '<table class="data-table">'
+    +     '<thead><tr><th>Name</th><th>Email</th><th>Role</th></tr></thead>'
+    +     '<tbody>'
+    +       users.map(function(u) {
+              return '<tr>'
+                + '<td><div class="agent-cell"><span class="avatar">' + (u.name[0] || u.email[0]).toUpperCase() + '</span><span>' + escapeHtml(u.name) + '</span></div></td>'
+                + '<td class="mono" style="font-size: 13px;">' + escapeHtml(u.email) + '</td>'
+                + '<td><span class="status-pill ' + (u.role === 'admin' ? '' : 'demo') + '">' + escapeHtml(u.role) + '</span></td>'
+                + '</tr>';
+            }).join('')
+    +     '</tbody>'
+    +   '</table>'
+    + '</div>';
+}
+
+// ─── ROI / Business case ──────────────────────────────────────────────────────
+async function renderRoi() {
+  app.innerHTML = topbarHtml() + '<div class="page-wrapper">'
+    + '<div class="page-eyebrow">Business case</div>'
+    + '<h1 class="page-title">From three days,<br><em>to three minutes.</em></h1>'
+    + '<p class="page-sub">A central platform for deploying enterprise AI agents replaces months of bespoke per-team infrastructure work with a single, governed, region-aware control plane. Below: what it delivers today, and what comes next.</p>'
+    + '<div class="page-divider"></div>'
+    + '<div id="roi-content"><div class="loading-skeleton" style="height: 200px;"></div></div>'
+    + '</div>';
+  wireTopbar();
+
+  try {
+    var data = await api('/api/roi');
+    state.roi = data;
+    document.getElementById('roi-content').innerHTML = ''
+      + '<div class="roi-grid">'
+      +   data.metrics.map(function(m, i) {
+            var colorClass = i === 0 ? 'good' : (i % 2 === 0 ? 'accent' : '');
+            return '<div class="roi-card">'
+              + '<div class="roi-val ' + colorClass + '">' + escapeHtml(m.value) + '</div>'
+              + '<div class="roi-lbl">' + escapeHtml(m.label) + '</div>'
+              + '<div class="roi-sub">' + escapeHtml(m.sub) + '</div>'
+              + '</div>';
+          }).join('')
+      + '</div>'
+      + '<div class="roadmap-section">'
+      +   '<h2>What\'s next on the roadmap.</h2>'
+      +   '<p class="lead">The platform is production-ready for dedicated tenancy across two regions. Upcoming work focuses on shared tenancy, real telemetry, and self-service onboarding.</p>'
+      +   '<div class="roadmap-list">'
+      +     data.roadmap.map(function(item) {
+              return '<div class="roadmap-item">'
+                + '<div class="rm-badge ' + item.phase.toLowerCase() + '">' + escapeHtml(item.phase) + '</div>'
+                + '<div class="rm-content">'
+                +   '<div class="rm-title">' + escapeHtml(item.title) + '</div>'
+                +   '<div class="rm-desc">' + escapeHtml(item.desc) + '</div>'
+                + '</div>'
+                + '</div>';
+            }).join('')
+      +   '</div>'
+      + '</div>';
+  } catch (err) {
+    document.getElementById('roi-content').innerHTML = '<div class="empty-state"><h3>Could not load business case</h3><p>' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+// ─── Weekly digest page ──────────────────────────────────────────────────────
+// Admin-only. Renders aggregated platform activity over the chosen window
+// (7, 14, or 30 days) in an editorial layout that's email-ready — copy the
+// rendered region into your mail client to send manually, or wire up the
+// /api/digest JSON to your own scheduler.
+
+var digestState = { days: 7 };
+
+async function renderDigest() {
+  app.innerHTML = topbarHtml() + '<div class="page-wrapper">'
+    + '<div class="page-eyebrow">Activity</div>'
+    + '<h1 class="page-title">Weekly digest<br><em>at a glance.</em></h1>'
+    + '<p class="page-sub">Platform activity over the chosen window — deploys, regions, top agents, top deployers, and the manual-engineering hours saved. Designed to be copy-pasted into your team\'s weekly update.</p>'
+    + '<div class="page-divider"></div>'
+    + '<div class="digest-period-toggle" id="digest-toggle">'
+    +   '<button class="digest-period-btn ' + (digestState.days === 7 ? 'active' : '') + '" data-days="7">Last 7 days</button>'
+    +   '<button class="digest-period-btn ' + (digestState.days === 14 ? 'active' : '') + '" data-days="14">Last 14 days</button>'
+    +   '<button class="digest-period-btn ' + (digestState.days === 30 ? 'active' : '') + '" data-days="30">Last 30 days</button>'
+    + '</div>'
+    + '<div id="digest-content"><div class="empty-state">Loading digest…</div></div>'
+    + '</div>';
+  wireTopbar();
+
+  document.querySelectorAll('#digest-toggle .digest-period-btn').forEach(function(b) {
+    b.addEventListener('click', function() {
+      digestState.days = parseInt(b.dataset.days, 10);
+      render();
+    });
+  });
+
+  try {
+    var d = await api('/api/digest?days=' + digestState.days);
+    var topAgentsHtml = (d.topAgents || []).map(function(a) {
+      var pct = (a.count / Math.max(1, d.maxAgentCount)) * 100;
+      return '<div class="digest-bar-row">'
+        +   '<div class="digest-bar-label">' + escapeHtml(a.name) + '</div>'
+        +   '<div class="digest-bar-track"><div class="digest-bar-fill" style="width: ' + pct + '%; --digest-bar-color: ' + escapeAttr(a.color) + ';"></div></div>'
+        +   '<div class="digest-bar-val">' + a.count + '</div>'
+        + '</div>';
+    }).join('');
+
+    var regionsHtml = (d.regionTallies || []).map(function(r) {
+      return '<div class="digest-list-row">'
+        +   '<div class="agent">' + escapeHtml(r.flag || '') + ' ' + escapeHtml(r.name) + '</div>'
+        +   '<div class="meta">' + r.count + ' ' + (r.count === 1 ? 'deploy' : 'deploys') + '</div>'
+        +   '<div class="when"></div>'
+        + '</div>';
+    }).join('');
+
+    var usersHtml = (d.topUsers || []).map(function(u) {
+      return '<div class="digest-list-row">'
+        +   '<div class="agent">' + escapeHtml(u.name) + '</div>'
+        +   '<div class="meta">' + u.count + ' ' + (u.count === 1 ? 'deploy' : 'deploys') + '</div>'
+        +   '<div class="when"></div>'
+        + '</div>';
+    }).join('');
+
+    var latestHtml = (d.latest || []).map(function(x) {
+      var when = new Date(x.createdAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      return '<div class="digest-list-row">'
+        +   '<div class="agent">' + escapeHtml(x.agentName) + ' <span class="meta">→ ' + escapeHtml(x.regionFlag || '') + ' ' + escapeHtml(x.regionName) + '</span></div>'
+        +   '<div class="meta">' + escapeHtml(x.userName || 'admin') + '</div>'
+        +   '<div class="when">' + escapeHtml(when) + '</div>'
+        + '</div>';
+    }).join('');
+
+    var when = new Date(d.period.now).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+    document.getElementById('digest-content').innerHTML = ''
+      + '<div class="digest-card">'
+      +   '<div class="digest-eyebrow">AgentOS Digest · ' + escapeHtml(when) + ' · Last ' + d.period.days + ' days</div>'
+      +   '<h2 class="serif" style="font-family: \'Source Serif 4\', Georgia, serif; font-size: 32px; font-weight: 500; letter-spacing: -0.02em; margin-bottom: 6px; color: var(--navy);">Here\'s what your team shipped.</h2>'
+      +   '<p style="color: var(--text-2); font-size: 14px; margin-bottom: 28px;">' + d.headline.deploys + ' deploys · ' + d.headline.uniqueAgents + ' agents touched · across ' + d.headline.regions + ' ' + (d.headline.regions === 1 ? 'region' : 'regions') + '.</p>'
+      +   '<div class="digest-headline-grid">'
+      +     '<div class="digest-stat"><div class="digest-stat-num">' + d.headline.deploys + '</div><div class="digest-stat-lbl">Deploys</div></div>'
+      +     '<div class="digest-stat"><div class="digest-stat-num">' + d.headline.uniqueAgents + '</div><div class="digest-stat-lbl">Unique agents</div></div>'
+      +     '<div class="digest-stat"><div class="digest-stat-num">' + d.headline.regions + '</div><div class="digest-stat-lbl">Regions used</div></div>'
+      +     '<div class="digest-stat"><div class="digest-stat-num">' + formatMoney(d.headline.savingsUsd) + '</div><div class="digest-stat-lbl">Vs manual deploy</div></div>'
+      +   '</div>'
+
+      +   (topAgentsHtml ? (
+            '<div class="digest-section">'
+          +   '<h3>Most-deployed agents</h3>'
+          +   topAgentsHtml
+          + '</div>'
+          ) : '')
+
+      +   (regionsHtml ? (
+            '<div class="digest-section">'
+          +   '<h3>Region activity</h3>'
+          +   '<div class="digest-list">' + regionsHtml + '</div>'
+          + '</div>'
+          ) : '')
+
+      +   (usersHtml ? (
+            '<div class="digest-section">'
+          +   '<h3>Top deployers</h3>'
+          +   '<div class="digest-list">' + usersHtml + '</div>'
+          + '</div>'
+          ) : '')
+
+      +   (latestHtml ? (
+            '<div class="digest-section">'
+          +   '<h3>Recent deploys</h3>'
+          +   '<div class="digest-list">' + latestHtml + '</div>'
+          + '</div>'
+          ) : '')
+
+      +   (d.headline.deploys === 0 ? '<div class="empty-state"><p>No deploys in this period yet — try a longer window or push your first deploy from the Catalog.</p></div>' : '')
+      + '</div>';
+  } catch (err) {
+    document.getElementById('digest-content').innerHTML = '<div class="empty-state"><h3>Could not load digest</h3><p>' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+// ─── AgentOS Assistant — AI chat widget ───────────────────────────────────────
+//
+// Floating bottom-right button that opens a panel where the user can ask about
+// agents, regions, costs, compliance, or stuck deploys. Hits POST /api/chat
+// on the server, which uses the Anthropic API if ANTHROPIC_API_KEY is set or
+// a rule-based fallback otherwise.
+
+var chatState = {
+  open: false,
+  history: [],   // [{ role: 'user'|'assistant', content: '...' }]
+  pending: false
+};
+
+var CHAT_SUGGESTIONS_DEFAULT = [
+  'What agents are available?',
+  'Which regions can I deploy to?',
+  'How much does it cost?',
+  'How long does a deploy take?'
+];
+
+var CHAT_SUGGESTIONS_DEPLOYING = [
+  'Why is this taking so long?',
+  'What\'s happening behind the scenes?',
+  'Can I close this and come back?',
+  'Is my data secure?'
+];
+
+function ensureChatFab() {
+  if (document.getElementById('chat-fab')) return;
+  var fab = document.createElement('button');
+  fab.id = 'chat-fab';
+  fab.className = 'chat-fab';
+  fab.setAttribute('aria-label', 'Open AgentOS Assistant');
+  fab.innerHTML = '<span class="pulse-ring"></span><span style="position:relative">💬</span>';
+  fab.addEventListener('click', toggleChatPanel);
+  document.body.appendChild(fab);
+}
+
+function removeChatUi() {
+  var fab = document.getElementById('chat-fab');
+  if (fab) fab.remove();
+  var panel = document.getElementById('chat-panel');
+  if (panel) panel.remove();
+  chatState.open = false;
+}
+
+function toggleChatPanel() {
+  if (chatState.open) closeChatPanel();
+  else openChatPanel();
+}
+
+function openChatPanel() {
+  if (chatState.open) return;
+  chatState.open = true;
+
+  var fab = document.getElementById('chat-fab');
+  if (fab) {
+    fab.classList.add('is-open');
+    fab.innerHTML = '<span style="position:relative;font-size:24px">+</span>';
+  }
+
+  var panel = document.createElement('div');
+  panel.id = 'chat-panel';
+  panel.className = 'chat-panel';
+  panel.innerHTML = ''
+    + '<div class="chat-panel-header">'
+    +   '<div class="chat-avatar">A</div>'
+    +   '<div class="chat-title-block">'
+    +     '<div class="chat-title">AgentOS Assistant</div>'
+    +     '<div class="chat-status-line"><span class="dot"></span>Ready to help</div>'
+    +   '</div>'
+    +   '<button class="chat-close-btn" id="chat-close-btn" aria-label="Close">×</button>'
+    + '</div>'
+    + '<div class="chat-body" id="chat-body"></div>'
+    + '<div class="chat-suggestions" id="chat-suggestions"></div>'
+    + '<div class="chat-input-row">'
+    +   '<textarea class="chat-input" id="chat-input" rows="1" placeholder="Ask about agents, regions, costs..."></textarea>'
+    +   '<button class="chat-send-btn" id="chat-send-btn">Send</button>'
+    + '</div>';
+  document.body.appendChild(panel);
+
+  document.getElementById('chat-close-btn').addEventListener('click', closeChatPanel);
+
+  var input = document.getElementById('chat-input');
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+  input.addEventListener('input', function() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  });
+  document.getElementById('chat-send-btn').addEventListener('click', sendChatMessage);
+
+  // Greeting if first time
+  if (chatState.history.length === 0) {
+    var contextAgent = getChatContextAgent();
+    var greeting = contextAgent
+      ? 'Hi! I\'m the AgentOS Assistant. I see you\'re looking at ' + contextAgent.name + ' — ask me anything about it, where to deploy, or what it costs.'
+      : 'Hi! I\'m the AgentOS Assistant. Ask me about agents, regions, costs, compliance, or how deployments work.';
+    chatState.history.push({ role: 'assistant', content: greeting });
+  }
+
+  renderChatHistory();
+  renderChatSuggestions();
+  setTimeout(function() { input.focus(); }, 100);
+}
+
+function closeChatPanel() {
+  chatState.open = false;
+  var panel = document.getElementById('chat-panel');
+  if (panel) panel.remove();
+  var fab = document.getElementById('chat-fab');
+  if (fab) {
+    fab.classList.remove('is-open');
+    fab.innerHTML = '<span class="pulse-ring"></span><span style="position:relative">💬</span>';
+  }
+}
+
+function getChatContextAgent() {
+  // If the deploy modal or progress modal is open, pin context to that agent
+  if (typeof deployModal !== 'undefined' && deployModal && deployModal.agent) return deployModal.agent;
+  if (typeof activeProgress !== 'undefined' && activeProgress && activeProgress.agent) return activeProgress.agent;
+  return null;
+}
+
+function getChatContextRegion() {
+  if (typeof deployModal !== 'undefined' && deployModal && deployModal.selectedRegion) {
+    return { id: deployModal.selectedRegion };
+  }
+  if (typeof activeProgress !== 'undefined' && activeProgress && activeProgress.region) {
+    return { id: activeProgress.region.id };
+  }
+  return null;
+}
+
+function renderChatHistory() {
+  var body = document.getElementById('chat-body');
+  if (!body) return;
+  body.innerHTML = chatState.history.map(function(m) {
+    return '<div class="chat-msg ' + m.role + (m.error ? ' error' : '') + '">'
+         +   '<div class="chat-bubble">' + escapeHtml(m.content) + '</div>'
+         + '</div>';
+  }).join('');
+  if (chatState.pending) {
+    body.innerHTML += ''
+      + '<div class="chat-msg assistant">'
+      +   '<div class="chat-bubble"><div class="chat-typing"><span></span><span></span><span></span></div></div>'
+      + '</div>';
+  }
+  body.scrollTop = body.scrollHeight;
+}
+
+function renderChatSuggestions() {
+  var slot = document.getElementById('chat-suggestions');
+  if (!slot) return;
+  // Hide suggestions once user is in conversation
+  if (chatState.history.filter(function(m) { return m.role === 'user'; }).length >= 1) {
+    slot.innerHTML = '';
+    return;
+  }
+  var suggestions = (typeof activeProgress !== 'undefined' && activeProgress && !activeProgress.resultRendered)
+    ? CHAT_SUGGESTIONS_DEPLOYING
+    : CHAT_SUGGESTIONS_DEFAULT;
+  slot.innerHTML = suggestions.map(function(s) {
+    return '<button class="chat-chip" data-q="' + escapeAttr(s) + '">' + escapeHtml(s) + '</button>';
+  }).join('');
+  slot.querySelectorAll('.chat-chip').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var input = document.getElementById('chat-input');
+      input.value = btn.dataset.q;
+      sendChatMessage();
+    });
+  });
+}
+
+async function sendChatMessage() {
+  if (chatState.pending) return;
+  var input = document.getElementById('chat-input');
+  if (!input) return;
+  var text = (input.value || '').trim();
+  if (!text) return;
+
+  chatState.history.push({ role: 'user', content: text });
+  chatState.pending = true;
+  input.value = '';
+  input.style.height = 'auto';
+  renderChatHistory();
+  renderChatSuggestions();
+
+  var ctxAgent = getChatContextAgent();
+  var ctxRegion = getChatContextRegion();
+  var context = {};
+  if (ctxAgent) context.agentId = ctxAgent.id;
+  if (ctxRegion) context.regionId = ctxRegion.id;
+
+  try {
+    var res = await api('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: text,
+        history: chatState.history.slice(0, -1).slice(-12),
+        context: context
+      })
+    });
+    chatState.history.push({ role: 'assistant', content: res.reply || '(no reply)' });
+  } catch (err) {
+    var errMsg = (err && err.message) || 'unknown error';
+    var isAuth = /auth required|not authenticated|HTTP 401/i.test(errMsg);
+    chatState.history.push({
+      role: 'assistant',
+      content: isAuth
+        ? 'Your session has ended. Please refresh this page and sign in again to keep chatting with the assistant.'
+        : 'Sorry — I couldn\'t reach the assistant just now. ' + errMsg,
+      error: true
+    });
+  }
+  chatState.pending = false;
+  renderChatHistory();
+}
+
+async function signOut() {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch (e) {}
+  state.user = null;
+  state.view = 'login';
+  render();
+}
+
+(async function boot() {
+  try {
+    var me = await api('/api/auth/me');
+    state.user = me.user;
+    await loadCatalog();
+    state.view = 'marketplace';
+  } catch (e) {
+    state.view = 'login';
+  }
+  render();
+})();
+</script>
+</body>
+</html>

